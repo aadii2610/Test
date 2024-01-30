@@ -15,3 +15,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "Progress Library"
 include ':app'
+include ':progresslibrary'
