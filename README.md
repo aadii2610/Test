@@ -1,132 +1,157 @@
-# Android Feature Implementation Assessment
+# Android Technical Assessment & Engineering Governance Document
 
-**RefundMainFragment – New Feature**
+**Delivery Orders in Orders Hub (DoorDash Drive)**
+
+Before starting development, consider going over: **Android Best Practices.docx**.
 
 ---
 
-**Purpose:** This document ensures that every Android feature implementation evaluates existing module quality before modification, preserves architectural integrity, prevents uncontrolled technical debt, assesses performance and memory impact, documents trade-offs explicitly, and maintains long-term maintainability and scalability. This assessment is mandatory for all L3 and L4 complexity tickets and recommended for L2.
+## Purpose
+
+This document ensures that every Android feature implementation:
+
+- Evaluates existing module quality before modification
+- Preserves architectural integrity
+- Prevents uncontrolled technical debt
+- Assesses performance and memory impact
+- Documents trade-offs explicitly
+- Maintains long-term maintainability and scalability
+
+This assessment is **mandatory** for all L3 and L4 complexity tickets and **recommended** for L2.
 
 ---
 
 ## 1. Feature Overview
 
 | Field | Value |
-|-------|-------|
-| Jira Ticket | *[To be filled]* |
-| Feature Name | New feature in RefundMainFragment |
-| Module / Layer Affected | UI (pos module – `aio.app.pos.ui.main.fragments.refund.RefundMainFragment`); cross-module (PaymentParentFragment, MainViewModel, PaymentViewModel, TicketViewModel, SharedDataRepository) |
-| Tech Lead / Owner | *[To be filled]* |
-| Estimated Complexity | *L1 / L2 / L3 / L4* |
-| Initial Risk Level | *Low / Medium / High* |
-| Dependencies | Internal: MainViewModel, PaymentViewModel, TicketViewModel, BusinessIdViewModel, PrinterViewModel, SharedDataRepository, RefundReasonView, RefundConfirmationView, RefundCompleteView, PaymentSelectionView, RefundAmountSelectionView. External: Hilt, Room (via ViewModels), LocalBroadcastManager, Analytics, NewRelic logging. |
-| Target Release Date | *[To be filled]* |
+|-------|--------|
+| **Jira Ticket** | *[To be filled]* |
+| **Feature Name** | Delivery order management in Orders Hub (DoorDash Drive) |
+| **Module / Layer Affected** | **UI** (Orders Hub: `OrdersHubParentActivity`, `OrdersHubParentFragment`, `OrdersHubTicketsFragment`, `OrderInfoDialog`); **Domain** (orderhub use cases, mappers); **Data** (OrderHub DAO/DTO, remote API, webhooks); **Cross-module** (MQTT/SSE for webhook updates, KDS, ticket/register) |
+| **Tech Lead / Owner** | *[To be filled]* |
+| **Estimated Complexity** | **L3** (new lifecycle tabs, driver status model, webhook integration, order details panel changes) |
+| **Initial Risk Level** | **Medium** (external provider dependency, real-time updates, lifecycle rules) |
+| **Dependencies** | **Internal:** OrderHub (ViewModel, Repository, Local/Remote DataSource, Filters), TicketData/OrderEntity/DeliveryEntity, OrderHubTypesEnum (DELIVERY exists), OrderHubStatusEnum, OrderHubDataState (Delivery tab exists). **External:** DoorDash Drive API, webhooks (provider status events), backend for order/status sync. |
+| **Target Release Date** | *[To be filled]* |
 
 ### Business Context
 
-- **Problem being solved:** *[Describe the problem the new feature addresses]*
-- **Expected user impact:** *[Describe impact on staff/refund flow]*
-- **Success criteria:** *[Define measurable success criteria]*
+- **Problem being solved:** Restaurants need to view and manage delivery orders (AIO Online Ordering + DoorDash Drive) inside POS Orders Hub, with both kitchen preparation state and delivery-provider (driver) state, without relying on external delivery tablets.
+- **Expected user impact:** Staff see delivery orders in a dedicated Delivery section with lifecycle tabs (Scheduled, In Kitchen, Ready, Completed, Cancelled), driver assignment status, driver phone number, ticket number, and order details popup; orders move between tabs automatically via webhook updates.
+- **Success criteria:** Delivery orders appear within 2 seconds; ticket number assigned; customer name and driver status visible; driver name/phone visible after assignment; correct tab transitions (e.g. prep window → In Kitchen, kitchen ready → Ready, delivered → Completed); Order Info popup shows delivery and driver details.
 
 ---
 
 ## 2. Existing Code Review (Mandatory Pre-Implementation Step)
 
+The feature owner must review the current state of the affected module before implementation.
+
 ### 2.1 Architecture & Layering Review
 
-- **ViewModel responsibility boundaries:** RefundMainFragment uses five ViewModels (MainViewModel, PaymentViewModel, TicketViewModel, BusinessIdViewModel, PrinterViewModel). Refund-specific state (reason, amounts, flow flags) lives partly in Fragment and partly in MainViewModel (reasonDialog, nextBtn, refundAmountConfirm, refundTipConfirm, refundServiceChargesConfirm, refundGratuityConfirm). No dedicated RefundViewModel; refund flow orchestration is in the Fragment.
-- **Repository abstraction:** Data access is via PaymentViewModel (getCurrentTicketFromDb, refundPaymentNew, postCashRefund, getPaymentRefundId, updatePaymentFields), TicketViewModel (cancelScheduleOrder, updatePaymentFieldsWithBackendValues). Repository layer is not directly used by the Fragment.
-- **UseCase / Domain isolation:** No Clean Architecture use cases observed; business rules (full/partial refund, scheduled order cancellation, card vs cash, payment status) are implemented inside RefundMainFragment.
-- **Separation of concerns:** Fragment contains substantial business logic: refund type calculation, payment status derivation, card/cash refund branching, scheduled order cancel-then-refund flow, receipt options, and DB updates. UI and business logic are not separated.
-- **Cross-module dependency violations:** Fragment depends on PaymentParentFragment (parentFragment cast for clearRefundMainFragment(), setBillFragment(), setTicketPanFragment()). Constants SELECTEDPAYMENT and SELECTEDPAYMENTID (and REFUNDID) are global mutable state used across modules.
-- **DI graph integrity:** Hilt @AndroidEntryPoint and @Inject SharedDataRepository used; ViewModels obtained via activityViewModels() / viewModels(). No obvious DI violations.
+- **ViewModel responsibility boundaries:** `OrdersHubViewModel` holds UI state (`OrderHubUiState`: filter, subFilter, searchQuery, searchFilter, orders), uses `GetAllOrdersUseCase`, `OrderHubFilterUseCase`, `GeSingleTicketUseCase`; emits `UiEvent`. Filter/tab state is driven by `OrderHubDataState` (AllTickets, ThirdParty, **Delivery**, TakeOut, DineIn + sub-filters: Active, Ready, Complete, Scheduled, Cancelled, etc.). Ensure delivery-specific state (driver status, provider status) stays in ViewModel or domain; avoid Fragment-owned business logic.
+- **Repository abstraction:** `OrdersHubRepository` / `OrdersHubRepositoryImpl`, `OrderHubRemoteDataSource`, `OrderHubLocalDataSource`; filters via `OrderHubFilterRepository`. Delivery orders will require repository/API support for mainFilter=delivery and provider-status mapping; ensure new fields (driver status, delivery_id) flow through existing layers.
+- **UseCase / Domain isolation:** `GetAllOrdersUseCase`, `OrderHubFilterUseCase`, `GeSingleTicketUseCase`; domain models `OrderHubBO`, `OrderHubFilter`, `OrderHubFilterBO`. Delivery lifecycle and provider-status → POS tab mapping are domain concerns; implement in use case or repository, not in Fragment.
+- **Separation of concerns:** `OrdersHubTicketsFragment` handles tab clicks, sort, search, adapter; `OrderInfoDialog` shows ticket/order/customer/delivery (rider) info. Keep tab transition logic (e.g. prep window, kitchen ready, delivered) and driver-status derivation in domain/data; Fragment only reflects UI state.
+- **Cross-module dependency violations:** Order Hub uses `SharedDataRepository` (ordersHubFilterStatus), `MainViewModel` (order hub item click). Delivery webhooks may come via MQTT/SSE or backend sync; document integration point and avoid circular dependencies.
+- **DI graph integrity:** Hilt used (`@AndroidEntryPoint`, `@HiltViewModel`); ViewModels injected in Activity/Fragment. New delivery data sources or use cases must be provided via modules.
 
 ### 2.2 Concurrency & Coroutine Audit
 
-- **Dispatcher correctness:** IO and Main are used. lifecycleScope.launch(IO) and withContext(Main) used in many places appropriately. getPaymentRefundId() uses `CoroutineScope(IO).launch { … }` — unscoped, not tied to lifecycle.
-- **Structured concurrency:** lifecycleScope is used for most launches; getPaymentRefundId uses an independent CoroutineScope(IO), so that coroutine is not cancelled when the Fragment is destroyed.
-- **runBlocking usage:** runBlocking(IO) is used in onCreateView (ticket data fetch), updateRefundTypeText(), selectedPayment(), confirmBtn click (multiple times), movingBack(), cardRefund(), and inside lifecycleScope.launch blocks. Blocking the main thread in onCreateView is a risk; blocking inside click handlers that run on Main can cause ANR if IO is slow.
-- **Unscoped coroutines:** CoroutineScope(IO).launch in getPaymentRefundId() is unscoped — can outlive the Fragment and touch views/ViewModel after detachment.
-- **Flow cold/hot misuse:** N/A; refund flow uses LiveData and direct calls.
-- **Backpressure / cancellation:** No Flow backpressure issue. Unscoped launch in getPaymentRefundId is not cancelled on Fragment destroy.
+- **Dispatcher correctness:** ViewModel uses `viewModelScope`, `Dispatchers.IO` for use case calls; Fragment uses `lifecycleScope` and `withContext(Main)` for UI. Webhook handling (when implemented) must use IO for parsing and Main for UI updates; avoid blocking main thread.
+- **Structured concurrency:** `flatMapLatest` + `flow` in ViewModel for order list; job cancelled on filter change. Delivery webhook processing should be lifecycle-scoped (e.g. Application or Repository scope) and not leak Fragment reference.
+- **SupervisorJob misuse:** Not observed in current Order Hub; if delivery introduces parallel flows (e.g. poll + webhook), use supervisor where appropriate.
+- **Unscoped coroutines:** Avoid `GlobalScope` or `CoroutineScope(IO).launch` without lifecycle; webhook handlers should be tied to Repository or Application.
+- **Flow cold/hot misuse:** Order list is cold Flow from use case; ensure delivery status updates (e.g. from webhook) emit via StateFlow/SharedFlow so UI collects once.
+- **Backpressure / Cancellation:** High-frequency webhook events should be throttled or conflated before updating UI state.
+- **Cancellation awareness:** Use case and repository suspend functions should respect cancellation; webhook processing should not hold references to destroyed UI.
 
 ### 2.3 Data Layer Review
 
-- **Room queries performance:** getCurrentTicketFromDb (PaymentFragmentExtensions) uses getSelectedTicketData, getTicketItems, getCustomTicketItems (suspend). TicketDao uses @Query and @Transaction. No index usage validated in this assessment.
-- **N+1 query risks:** Single ticket fetch assembles ticket + items + custom items in one logical flow. Multiple redundant getCurrentTicketFromDb calls in the same user flow — not N+1 but duplicate work.
-- **Transaction correctness:** Refund success paths update payment/refunds via paymentViewModel.updatePaymentFields or ticketViewModel.updatePaymentFieldsWithBackendValues; no in-Fragment transactions.
-- **Migration readiness:** Not applicable unless schema changes are introduced.
-- **API error mapping:** Refund API errors are handled via response?.success, response?.error, response?.message; user sees toast/snackbar.
+- **Room queries performance:** `OrderHubNewDao` / `OrderHubDao`; ensure delivery filter (mainFilter=delivery) and new columns (e.g. driver_status, delivery_id, provider_status) are indexed or covered by existing queries; avoid N+1 when loading order list with delivery details.
+- **Index usage validation:** Confirm indexes on (orderType/serveType, orderStatus, ticketPaymentStatus) or equivalent for delivery tab queries.
+- **N+1 query risks:** If delivery metadata lives in a separate table, prefer single query with relation or embedded DTO to avoid per-order lookups.
+- **Transaction correctness:** Webhook-driven updates (e.g. provider status, driver assigned) must update local DB in a transaction where needed; avoid partial state.
+- **Migration readiness:** New columns (driver_status, provider_status, delivery_id, driver_phone, driver_name, etc.) require Room migration and version bump; document rollback.
+- **API error mapping:** Backend/DoorDash API errors must map to user-visible messages and retry strategy; duplicate events ignored by delivery_id.
 
 ### 2.4 UI & State Management Review
 
-- **Single source of truth:** Refund state is split: Fragment holds refundedAmount, refundedTax, refundedTip, refundedServiceCharges, refundedGratuity, reason, refundDateTime, flow flags. MainViewModel holds nextBtn, reasonDialog, refundAmountConfirm, refundTipConfirm, refundServiceChargesConfirm, refundGratuityConfirm, refundItems. SELECTEDPAYMENT/SELECTEDPAYMENTID/REFUNDID are global Constants. No single source of truth for the refund flow.
-- **Immutable UI state:** Fragment state is mutable (var). MainViewModel exposes MutableLiveData (nextBtn, reasonDialog, refundAmountConfirm) — mutable types exposed as public.
-- **StateFlow/LiveData misuse:** LiveData used for one-time events (refundTipConfirm, etc.) with Event wrapper in some cases; refundAmountConfirm and reasonDialog are not one-time. Observers attached with requireActivity() instead of viewLifecycleOwner for several LiveData instances.
-- **One-time event handling:** Tip/service/gratuity use Event.getContentIfNotHandled(); reasonDialog and refundAmountConfirm do not use Event and can re-trigger if reobserved.
-- **Configuration change safety:** Fragment retains many vars; ViewModels are activity/fragment scoped. runBlocking in onCreateView can block during config change. observe(requireActivity()) ties observers to Activity lifecycle, not Fragment.
-- **Compose recomposition risks:** N/A; XML views.
+- **Single source of truth:** Order list and filters already in `OrderHubUiState`; add delivery-specific state (e.g. driver status per order, selected order for details) in same state or dedicated StateFlow; avoid duplicate state in Fragment.
+- **Immutable UI state:** Use data classes and `copy()` for state updates; expose `StateFlow`/`LiveData` read-only; avoid mutable public properties.
+- **StateFlow/LiveData misuse:** Order Hub uses StateFlow for uiState and SharedFlow for events; continue pattern for delivery events (e.g. driver arrived).
+- **One-time event handling:** Use SharedFlow or Event wrapper for one-time events (e.g. “driver arrived” toast); avoid re-emitting on config change.
+- **Configuration change safety:** ViewModel survives config change; ensure delivery state (selected tab, order list, driver status) is in ViewModel, not Fragment vars.
+- **Compose recomposition risks:** N/A (XML/View-based); if any Compose is introduced for delivery, avoid heavy logic in composables.
 
 ### 2.5 Performance & Memory Review
 
-- **Large ViewModels:** MainViewModel is shared and large; RefundMainFragment adds usage of multiple ViewModels. Fragment itself is very large (~2156 lines).
-- **Memory leaks:** Observers using requireActivity() can outlive the Fragment. LocalBroadcastManager receiver registered in onResume/unregistered in onPause — correct. Manual nulling of views and removeObservers in onDestroy reduces leak risk but observer lifecycle owner is still wrong for some.
-- **Heavy object allocation:** Multiple custom views created in onCreateView; log maps created frequently for analytics.
-- **Bitmap handling:** Not observed in refund flow.
-- **RecyclerView:** PaymentSelectionView uses RecyclerView; no inefficiency identified.
-- **Cold start impact:** runBlocking in onCreateView can delay first frame if DB is slow.
-- **Frame drops risk:** runBlocking on Main (waiting on IO) can cause jank; Handler.postDelayed(..., 3000) used for UI updates after refund.
+- **Large ViewModels:** OrdersHubViewModel already carries filter + orders; adding delivery fields should not duplicate full order list; consider paging if delivery order count is large.
+- **Memory leaks:** OrderInfoDialog and list item click callbacks must use viewLifecycleOwner or clear references on destroy; webhook listeners must unregister.
+- **Heavy object allocation:** Avoid creating large objects per webhook; prefer incremental state updates.
+- **Bitmap handling:** N/A for delivery feature.
+- **RecyclerView inefficiencies:** Reuse existing `OrdersHubTicketAdapter` pattern; use DiffUtil or ListAdapter for delivery list updates to avoid full refresh and scroll loss.
+- **Cold start impact:** Delivery tab data can load on demand when user selects Delivery filter; avoid loading all delivery orders at app start.
+- **Frame drops risk:** Webhook-driven list updates should post to Main and batch if needed; avoid heavy work on main thread.
 
 ### 2.6 Reliability & Stability
 
-- **Crash reports (last 30–90 days):** *[Check Firebase/Crashlytics/NewRelic for refund-related crashes]*
-- **ANR reports:** *[Check ANR for main-thread block – runBlocking in onCreateView and click handlers]*
-- **Unhandled exceptions:** try/catch used in print receipt amount parsing; card/cash refund paths use response checks. Gson.fromJson in handleSSEEvent could throw; not wrapped in try/catch.
-- **Error propagation:** Refund API failures show snackbar/toast; loader hidden via Handler.postDelayed. No structured error propagation to a single handler.
-- **Retry logic:** No retry logic for refund API or cancel scheduled order; user must retry manually.
+- **Crash reports (last 30–90 days):** *[Check Firebase/Crashlytics for Orders Hub / orderhub / delivery]*  
+- **ANR reports:** *[Check for main-thread work in Order Hub]*  
+- **Unhandled exceptions:** Webhook payload parsing (e.g. DoorDash provider status) must be in try/catch; invalid or unknown status should not crash.  
+- **Error propagation strategy:** Define how webhook failures and API errors surface (snackbar, silent retry, status sync retry).  
+- **Retry logic correctness:** PRD specifies “POS retries status sync”; implement bounded retry with backoff for webhook delay scenarios.
 
 ### 2.7 Test Coverage Assessment
 
-- **Unit test coverage %:** No unit tests found for RefundMainFragment or refund package.
-- **Integration test presence:** None identified for refund flow.
-- **Flaky tests:** N/A.
-- **Missing edge-case tests:** Refund flow (card/cash, full/partial, scheduled order, multi-payment) has no automated tests.
-- **Mocking anti-patterns:** N/A (no tests).
+- **Unit test coverage %:** *[Current Order Hub ViewModel/UseCase coverage]*  
+- **Integration test presence:** *[Order Hub repository/local DB tests]*  
+- **Flaky tests:** *[None identified]*  
+- **Missing edge-case tests:** Delivery-specific: driver not assigned, driver assigned after kitchen ready, driver arrives before order ready, duplicate webhooks, webhook delay.  
+- **Mocking anti-patterns:** Ensure webhook and API layers are mockable for unit tests.
 
 ---
 
 ## 3. Identified Issues Log
 
+Document all findings clearly.
+
 | Category | Issue Description | Severity | Risk Impact |
-|----------|-------------------|----------|-------------|
-| Concurrency | runBlocking(IO) in onCreateView and in click handlers — blocks calling thread; main thread can be blocked if called from UI thread. | High | ANR risk, UI jank |
-| Concurrency | CoroutineScope(IO).launch in getPaymentRefundId() — unscoped coroutine; not cancelled when Fragment is destroyed; can update UI/ViewModel after detachment. | High | Crash, memory leak, undefined behavior |
-| Architecture | Heavy business logic inside RefundMainFragment (refund type, payment status, card/cash/scheduled order branching, DB updates). | High | Hard to test, maintain, and extend |
-| UI / State | LiveData observers use requireActivity() as lifecycle owner — should use viewLifecycleOwner to avoid leaks and updates after detach. | Medium | Potential leak; wrong lifecycle |
-| UI / State | MainViewModel exposes MutableLiveData publicly (nextBtn, reasonDialog, refundAmountConfirm) — mutable state exposed. | Medium | Encapsulation violation; accidental mutations |
-| Architecture | Global mutable Constants (SELECTEDPAYMENT, SELECTEDPAYMENTID, REFUNDID) used across Fragment and other modules. | Medium | Tight coupling; testability; thread safety |
-| Reliability | handleSSEEvent uses Gson.fromJson without try/catch — can throw on malformed JSON. | Medium | Crash on bad SSE payload |
-| Performance | Multiple redundant getCurrentTicketFromDb (runBlocking) calls in the same flow. | Medium | Unnecessary DB load and main-thread blocking |
-| Bug | refundCompleteView!!.binding.noReceiptBtn.setOnClickListener set twice (second block overwrites first) — first block does back navigation logic; second does noReceipt analytics + movingBack(). Second registration wins. | Low | Wrong/noReceipt behavior or dead code |
-| Test | No unit or integration tests for RefundMainFragment or refund flow. | Low | Regressions, refactoring risk |
+|----------|-------------------|----------|--------------|
+| Architecture | Delivery lifecycle and provider-status → tab mapping logic could be implemented in Fragment | High | Hard to test, maintain, reuse |
+| Data | DeliveryEntity (commons) has name, phoneNumber but no provider_status, delivery_id, vehicle_type | Medium | Cannot support full PRD without model extension |
+| Data | No Room migration plan yet for delivery/driver columns | Medium | Blocking for persistence |
+| Concurrency | Webhook handling scope and threading not defined | Medium | ANR or leaks if done on main or unscoped |
+| UI | OrderInfoDialog shows rider info but not driver status (Searching/Assigned/EnRoute/Arrived/Delivered) or vehicle type | Medium | Incomplete UX per PRD |
+| Reliability | Duplicate webhook handling (by delivery_id) not implemented | Medium | Duplicate events could corrupt state |
+| Performance | Full list refresh on every webhook could cause scroll loss and jank | Medium | Bad UX |
+| Test | No automated tests for Delivery tab or driver status | Low | Regressions |
+
+*Additional issues may be added after deeper code review of OrderHubNewDao, webhook entry points, and OrderHubDataState usage.*
 
 ---
 
 ## 4. Improvement Decision Matrix (Mandatory)
 
-| Issue | Fix in Current Iteration? (Y/N) | Justification | Backlog Ticket | Target Sprint |
-|-------|--------------------------------|---------------|----------------|---------------|
-| runBlocking(IO) in onCreateView and click handlers | Y (recommended) | Concurrency violation — must fix to avoid ANR. Replace with lifecycleScope.launch + suspend + withContext(IO) and load data asynchronously; use loading state for UI. | *[Backlog ref]* | *[Sprint]* |
-| Unscoped CoroutineScope(IO).launch in getPaymentRefundId | Y (must) | Concurrency violation — must fix. Use lifecycleScope.launch(IO) and withContext(Main) for UI updates; ensure cancellation on destroy. | *[Backlog ref]* | *[Sprint]* |
-| Business logic in Fragment | N (or Y if scope allows) | Architectural — document and backlog. Fix in current iteration only if explicit approval; otherwise create RefundUseCase/RefundViewModel and move logic in a follow-up. | *[Backlog ref]* | *[Sprint]* |
-| Observers use requireActivity() | Y (recommended) | Lifecycle correctness — change to viewLifecycleOwner to prevent leaks and updates after detach. | *[Backlog ref]* | *[Sprint]* |
-| MutableLiveData exposed in MainViewModel | N | Encapsulation — backlog; expose only LiveData read-only in MainViewModel and keep MutableLiveData private. | *[Backlog ref]* | *[Sprint]* |
-| Global Constants SELECTEDPAYMENT / SELECTEDPAYMENTID / REFUNDID | N | Cross-module refactor — document; consider passing via ViewModel or arguments in a later iteration. | *[Backlog ref]* | *[Sprint]* |
-| Gson.fromJson in handleSSEEvent without try/catch | Y | Reliability — wrap in try/catch and log/ignore malformed SSE data. | *[Backlog ref]* | *[Sprint]* |
-| Redundant getCurrentTicketFromDb calls | N (or Y) | Performance — cache ticket in Fragment/ViewModel for the current refund flow where safe; or fix when removing runBlocking. | *[Backlog ref]* | *[Sprint]* |
-| noReceiptBtn listener set twice | Y | Bug — consolidate into one listener (merge back logic + noReceipt analytics + movingBack) and set once. | *[Backlog ref]* | *[Sprint]* |
-| No tests for refund flow | N (recommended to add) | Add at least critical path unit tests (e.g. RefundViewModel if introduced) or UI tests for confirm flow when scope allows. | *[Backlog ref]* | *[Sprint]* |
+For each identified issue:
 
-**Governance Rules:** Crash, ANR, or memory leak → Must fix immediately. Concurrency violation → Must fix. Architectural violation → Explicit approval required. Performance regression risk → Must be benchmarked. No issue may be ignored without documentation.
+| Issue | Fix in Current Iteration? (Y/N) | Justification | Backlog Ticket | Target Sprint |
+|-------|----------------------------------|---------------|----------------|---------------|
+| Lifecycle/tab mapping in domain | Y | Architectural; must be in UseCase/Repository for testability and single source of truth | *[Ref]* | *[Sprint]* |
+| Extend DeliveryEntity / DTO for provider_status, delivery_id, vehicle_type | Y | Required for PRD; backend/API contract must align | *[Ref]* | *[Sprint]* |
+| Room migration for delivery columns | Y | Required for persistence and rollback safety | *[Ref]* | *[Sprint]* |
+| Webhook scope and threading | Y | Concurrency governance; must fix | *[Ref]* | *[Sprint]* |
+| OrderInfoDialog driver status + vehicle | Y | PRD acceptance criteria | *[Ref]* | *[Sprint]* |
+| Dedupe by delivery_id | Y | PRD edge case | *[Ref]* | *[Sprint]* |
+| Incremental list updates (DiffUtil/ListAdapter) | Y (recommended) | Performance; avoid scroll loss | *[Ref]* | *[Sprint]* |
+| Delivery tab / driver status tests | N (recommended) | Add when scope allows | *[Ref]* | *[Sprint]* |
+
+**Governance Rules**
+
+- Crash, ANR, or memory leak → Must fix immediately  
+- Concurrency violation → Must fix  
+- Architectural violation → Explicit approval required  
+- Performance regression risk → Must be benchmarked  
+- No issue may be ignored without documentation  
 
 ---
 
@@ -134,36 +159,36 @@
 
 ### 5.1 UI Impact
 
-- **Layout changes?** *[To be filled when feature is defined — e.g. new views in fragment_refund_main.xml or child views]*
-- **Navigation changes?** Refund flow is hosted inside PaymentParentFragment (add/clear RefundMainFragment). New feature may add steps or branches; document any new navigation.
-- **State handling modifications?** Any new state should prefer ViewModel (or new RefundViewModel) and viewLifecycleOwner for observers; avoid adding more runBlocking or requireActivity() observers.
+- **Layout changes:** New or repurposed Delivery section in Orders Hub; Delivery tab already present in `OrderHubDataState.Delivery`; sub-tabs (Scheduled, In Kitchen, Ready, Completed, Cancelled) may reuse or extend existing sub-filter UI. Table columns: add **Driver Status** (and ensure Ticket No., Order ID, Order Time, Customer Name, Order Total, Order Status exist). Order Info popup: add/expand **Delivery Information** (instructions, driver name, phone, vehicle type) and **Driver Status**.
+- **Navigation changes:** No new activity; Delivery is a filter/tab within existing Orders Hub flow. Order details remain in OrderInfoDialog or equivalent.
+- **State handling modifications:** New state for driver status (and possibly provider_status) per order; tab state derived from lifecycle rules; use ViewModel and existing StateFlow pattern.
 
 ### 5.2 API Contract Impact
 
-- **Request/response changes?** *[If new feature calls new/updated refund or payment APIs, document here]*
-- **Error model changes?** *[Document if error codes or messages change]*
-- **Versioning required?** *[Backend/API version if applicable]*
+- **Request/response changes:** Backend must support delivery orders and DoorDash Drive provider status (new/placed/enroute/arrived/delivered/cancelled); may require new endpoints or webhook payload schema. Order list API may need to return driver_status, delivery_id, driver_phone, driver_name, vehicle_type for delivery orders.
+- **Error model changes:** Define error codes for delivery provider errors and map to user messages.
+- **Versioning required:** Confirm backend/API version and webhook version compatibility.
 
 ### 5.3 Database Impact
 
-- **Schema changes?** *[None unless new feature requires new tables/columns]*
-- **Migration needed?** *[If schema changes, add migration and version bump]*
-- **Data backfill required?** *[Usually no for refund UI feature]*
-- **Rollback feasibility?** Code rollback and feature flag recommended if feature is high risk.
+- **Schema changes:** New or extended columns for delivery: e.g. provider_status, delivery_id, driver_status, driver_name, driver_phone, vehicle_type, delivery_instructions; possibly scheduled_delivery_time, prep_time for Scheduled tab logic.
+- **Migration needed:** Yes; add migration and bump DB version; test upgrade path.
+- **Data backfill required:** Not for existing non-delivery orders; new delivery orders populated via API/webhook.
+- **Rollback feasibility:** Migration must be reversible or forward-compatible so rollback does not crash on new columns.
 
 ### 5.4 Performance Impact
 
-- **CPU impact:** Minimize work on main thread; avoid new runBlocking or heavy parsing in UI thread.
-- **Memory footprint:** Avoid retaining large objects in Fragment; use ViewModel for state that survives config change.
-- **Network payload size:** *[If new API calls, document payload size]*
-- **Startup time impact:** Refund flow is not on cold start path; ensure no new runBlocking in onCreateView.
-- **Expected load increase:** *[Document if new feature increases API or DB load]*
+- **CPU impact:** Webhook parsing and state updates should be on background thread; minimal main-thread work.
+- **Memory footprint:** Avoid holding full order payloads in memory; use paging if list is large.
+- **Network payload size:** Delivery fields will increase payload size; monitor and optimize if needed.
+- **Startup time impact:** No change if delivery data is loaded only when Delivery tab is selected.
+- **Expected load increase:** Webhook volume depends on DoorDash Drive activity; throttle/conflate updates.
 
 ### 5.5 Backward Compatibility
 
-- **Feature flags required?** *[Recommend if rollout is gradual or high risk]*
-- **Gradual rollout?** *[Yes/No and strategy]*
-- **Legacy support maintained?** Existing refund flow must continue to work; new feature should be additive or behind flag until validated.
+- **Feature flags required:** Recommended to gate Delivery section and webhook handling for gradual rollout.
+- **Gradual rollout:** Per PRD; consider by restaurant or region.
+- **Legacy support maintained:** Existing 3PO (third-party) and other Order Hub tabs must continue to work; Delivery is additive.
 
 ---
 
@@ -171,15 +196,16 @@
 
 | Risk | Probability | Impact | Mitigation Strategy |
 |------|-------------|--------|----------------------|
-| ANR from runBlocking on main thread | Medium | High | Replace runBlocking with async load (lifecycleScope + suspend); show loading state; benchmark onCreateView and click paths. |
-| Crash after Fragment destroy (unscoped coroutine) | Medium | High | Use lifecycleScope in getPaymentRefundId; check isAdded/view before updating UI; cancel on destroy. |
-| Regression in existing refund flow | Medium | High | Manual QA of full/partial, card/cash, scheduled order, multi-payment; consider feature flag for new behavior. |
-| Memory leak from wrong observer owner | Low–Medium | Medium | Switch observers to viewLifecycleOwner; verify with LeakCanary in refund flow. |
-| noReceiptBtn double registration causing wrong behavior | High | Low–Medium | Fix in current iteration: single listener with correct logic. |
+| Webhook delay or failure | Medium | High | Retry status sync; show “Searching for driver” until placed; document timeout behavior |
+| Duplicate webhooks corrupt state | Medium | High | Dedupe by delivery_id; idempotent updates |
+| Tab transition logic wrong (e.g. Ready vs In Kitchen) | Medium | High | Implement and test per PRD rules; code review and QA |
+| Driver PII (phone) exposure | Low | High | Show only after assignment; comply with privacy policy |
+| Main-thread webhook handling | Low | High | Enforce IO dispatcher and lifecycle scope in code review |
+| Regression in existing 3PO/Order Hub | Medium | High | Feature flag; QA of All/ThirdParty/TakeOut/DineIn tabs |
 
-**Rollback strategy:** Feature flag or version rollback; ensure no DB migration that cannot be reverted. Document steps to disable new feature and re-enable old path if needed.
+**Rollback strategy:** Feature flag to hide Delivery section and disable webhook handling; DB migration must not break existing app (nullable columns or compatible migration). Document steps to disable and re-enable.
 
-**Monitoring plan:** Monitor crash/ANR rates for refund-related screens (NewRelic/STM logs already used); add or tag events for new feature; set alerts on refund failure rate and latency.
+**Monitoring plan:** Log delivery webhook receipt and failures; monitor crash/ANR for Order Hub; alert on delivery sync failure rate or latency.
 
 ---
 
@@ -191,7 +217,4 @@
 | Platform Lead Approval | *[Name / Date / Signature]* |
 | Squad Lead Approval | *[Name / Date / Signature]* |
 | Product Acknowledgment | *[Name / Date / Signature]* |
-
----
-
-*Document generated for RefundMainFragment feature implementation. Fill placeholders (Jira, dates, ownership, success criteria, and approval blocks) before use. To create PDF: open the HTML version in a browser → Print → Save as PDF.*
+| Date | *[Date]* |
