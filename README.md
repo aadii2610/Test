@@ -1,220 +1,166 @@
-# Android Technical Assessment & Engineering Governance Document
+# Implementation Plan — Delivery Orders in Orders Hub (DoorDash Drive)
 
-**Delivery Orders in Orders Hub (DoorDash Drive)**
-
-Before starting development, consider going over: **Android Best Practices.docx**.
+High-level solution guide for **Delivery order management** in POS Orders Hub. This fits alongside the existing **3PO (third-party)** implementation; the same Order Hub structure (filters, tabs, table, order details) is extended for delivery lifecycle and driver status.
 
 ---
 
-## Purpose
+## Technical Debt Coverage
 
-This document ensures that every Android feature implementation:
+From the Technical Assessment doc, the following should be addressed **with** this feature where applicable:
 
-- Evaluates existing module quality before modification
-- Preserves architectural integrity
-- Prevents uncontrolled technical debt
-- Assesses performance and memory impact
-- Documents trade-offs explicitly
-- Maintains long-term maintainability and scalability
-
-This assessment is **mandatory** for all L3 and L4 complexity tickets and **recommended** for L2.
+- **Delivery lifecycle and tab mapping in domain:** Implement in UseCase/Repository (or dedicated mapper), not in Fragment — *must fix in this iteration.*
+- **Webhook scope and threading:** Define and implement webhook handling on IO dispatcher with lifecycle-safe scope (Repository or Application) — *must fix.*
+- **Duplicate webhook handling:** Ignore duplicate events using `delivery_id` — *must fix.*
+- **List updates:** Use incremental updates (e.g. DiffUtil / ListAdapter or equivalent) when applying webhook-driven changes to avoid scroll loss and frame drops — *recommended in this iteration.*
 
 ---
 
-## 1. Feature Overview
+## Architecture Point of View
 
-| Field | Value |
-|-------|--------|
-| **Jira Ticket** | *[To be filled]* |
-| **Feature Name** | Delivery order management in Orders Hub (DoorDash Drive) |
-| **Module / Layer Affected** | **UI** (Orders Hub: `OrdersHubParentActivity`, `OrdersHubParentFragment`, `OrdersHubTicketsFragment`, `OrderInfoDialog`); **Domain** (orderhub use cases, mappers); **Data** (OrderHub DAO/DTO, remote API, webhooks); **Cross-module** (MQTT/SSE for webhook updates, KDS, ticket/register) |
-| **Tech Lead / Owner** | *[To be filled]* |
-| **Estimated Complexity** | **L3** (new lifecycle tabs, driver status model, webhook integration, order details panel changes) |
-| **Initial Risk Level** | **Medium** (external provider dependency, real-time updates, lifecycle rules) |
-| **Dependencies** | **Internal:** OrderHub (ViewModel, Repository, Local/Remote DataSource, Filters), TicketData/OrderEntity/DeliveryEntity, OrderHubTypesEnum (DELIVERY exists), OrderHubStatusEnum, OrderHubDataState (Delivery tab exists). **External:** DoorDash Drive API, webhooks (provider status events), backend for order/status sync. |
-| **Target Release Date** | *[To be filled]* |
+Current Order Hub follows:
 
-### Business Context
+**UI → ViewModel → UseCase → Repository → LocalDataSource / RemoteDataSource → API / Room / MQTT**
 
-- **Problem being solved:** Restaurants need to view and manage delivery orders (AIO Online Ordering + DoorDash Drive) inside POS Orders Hub, with both kitchen preparation state and delivery-provider (driver) state, without relying on external delivery tablets.
-- **Expected user impact:** Staff see delivery orders in a dedicated Delivery section with lifecycle tabs (Scheduled, In Kitchen, Ready, Completed, Cancelled), driver assignment status, driver phone number, ticket number, and order details popup; orders move between tabs automatically via webhook updates.
-- **Success criteria:** Delivery orders appear within 2 seconds; ticket number assigned; customer name and driver status visible; driver name/phone visible after assignment; correct tab transitions (e.g. prep window → In Kitchen, kitchen ready → Ready, delivered → Completed); Order Info popup shows delivery and driver details.
+- **OrdersHubTicketsFragment** / **OrdersHubParentActivity** → **OrdersHubViewModel** → **GetAllOrdersUseCase** / **OrderHubFilterUseCase** / **GeSingleTicketUseCase** → **OrdersHubRepository** / **OrderHubFilterRepository** → **OrderHubLocalDataSource**, **OrderHubRemoteDataSource**.
+- Keep this hierarchy. Do **not** introduce extra layers (e.g. a separate “DeliveryManager”) unless explicitly agreed; extend existing Repository and UseCase for delivery.
+- **OrderHubDataState** already has `Delivery`; sub-filters (Scheduled, Active/In Kitchen, Ready, Complete, Cancelled) already exist. Delivery-specific **tab semantics** (Scheduled / In Kitchen / Ready / Completed / Cancelled) map to these; driver status is an **additional dimension** shown in the table and details panel.
 
 ---
 
-## 2. Existing Code Review (Mandatory Pre-Implementation Step)
+## Deep Dive in Code
 
-The feature owner must review the current state of the affected module before implementation.
+### 1. Orders Hub — Delivery Section and Tabs
 
-### 2.1 Architecture & Layering Review
+- **Fulfillment filter:** User selects **Delivery** (existing `OrderHubDataState.Delivery` / `OrderHubTypesEnum.DELIVERY`) to show only orders created via online ordering and fulfilled through DoorDash Drive.
+- **Lifecycle tabs:** Use existing sub-filter semantics; map PRD tabs to current status/subFilter:
+  - **Scheduled** → `OrderHubDataState.Filter.Scheduled` (future delivery, prep not started).
+  - **In Kitchen** → `OrderHubDataState.Filter.Active` (for delivery: preparation window started / kitchen preparing).
+  - **Ready** → `OrderHubDataState.Filter.Ready` (kitchen marked ready, waiting for driver).
+  - **Completed** → `OrderHubDataState.Filter.Complete` (delivered).
+  - **Cancelled** → `OrderHubDataState.Filter.Cancelled`.
+- **Tab transition logic** (domain/repository or use case):
+  - Scheduled → In Kitchen: when `current_time >= scheduled_delivery_time - prep_time` (backend or local rule).
+  - In Kitchen → Ready: when kitchen/KDS marks order ready (existing flow).
+  - Ready → Completed: when provider status = `delivered`.
+  - Any → Cancelled: when provider status = `cancelled`.
+- **Single source of truth:** Tab placement is derived from **order status + provider status**; compute in UseCase or Repository when returning orders for a given (mainFilter=delivery, subFilter=X). Fragment only displays the list and selected tab.
 
-- **ViewModel responsibility boundaries:** `OrdersHubViewModel` holds UI state (`OrderHubUiState`: filter, subFilter, searchQuery, searchFilter, orders), uses `GetAllOrdersUseCase`, `OrderHubFilterUseCase`, `GeSingleTicketUseCase`; emits `UiEvent`. Filter/tab state is driven by `OrderHubDataState` (AllTickets, ThirdParty, **Delivery**, TakeOut, DineIn + sub-filters: Active, Ready, Complete, Scheduled, Cancelled, etc.). Ensure delivery-specific state (driver status, provider status) stays in ViewModel or domain; avoid Fragment-owned business logic.
-- **Repository abstraction:** `OrdersHubRepository` / `OrdersHubRepositoryImpl`, `OrderHubRemoteDataSource`, `OrderHubLocalDataSource`; filters via `OrderHubFilterRepository`. Delivery orders will require repository/API support for mainFilter=delivery and provider-status mapping; ensure new fields (driver status, delivery_id) flow through existing layers.
-- **UseCase / Domain isolation:** `GetAllOrdersUseCase`, `OrderHubFilterUseCase`, `GeSingleTicketUseCase`; domain models `OrderHubBO`, `OrderHubFilter`, `OrderHubFilterBO`. Delivery lifecycle and provider-status → POS tab mapping are domain concerns; implement in use case or repository, not in Fragment.
-- **Separation of concerns:** `OrdersHubTicketsFragment` handles tab clicks, sort, search, adapter; `OrderInfoDialog` shows ticket/order/customer/delivery (rider) info. Keep tab transition logic (e.g. prep window, kitchen ready, delivered) and driver-status derivation in domain/data; Fragment only reflects UI state.
-- **Cross-module dependency violations:** Order Hub uses `SharedDataRepository` (ordersHubFilterStatus), `MainViewModel` (order hub item click). Delivery webhooks may come via MQTT/SSE or backend sync; document integration point and avoid circular dependencies.
-- **DI graph integrity:** Hilt used (`@AndroidEntryPoint`, `@HiltViewModel`); ViewModels injected in Activity/Fragment. New delivery data sources or use cases must be provided via modules.
+### 2. Delivery Provider Status Model
 
-### 2.2 Concurrency & Coroutine Audit
+- **Provider statuses** (from DoorDash Drive webhooks): `new`, `placed`, `enroute`, `arrived`, `delivered`, `cancelled`.
+- **Driver status (POS):** Map 1:1 for display:
+  - `new` → **Searching for Driver**
+  - `placed` → **Driver Assigned**
+  - `enroute` → **Driver En Route**
+  - `arrived` → **Driver Arrived** (or “Driver Waiting” if kitchen not ready)
+  - `delivered` → **Delivered**
+  - `cancelled` → **Cancelled**
+- **Provider status → POS tab:** As per PRD table (e.g. new/placed → Scheduled or In Kitchen; arrived → Ready; delivered → Completed; cancelled → Cancelled). Implement this mapping in **domain** (e.g. in Repository when persisting webhook payload, or in a mapper that computes `orderStatus` + tab eligibility).
 
-- **Dispatcher correctness:** ViewModel uses `viewModelScope`, `Dispatchers.IO` for use case calls; Fragment uses `lifecycleScope` and `withContext(Main)` for UI. Webhook handling (when implemented) must use IO for parsing and Main for UI updates; avoid blocking main thread.
-- **Structured concurrency:** `flatMapLatest` + `flow` in ViewModel for order list; job cancelled on filter change. Delivery webhook processing should be lifecycle-scoped (e.g. Application or Repository scope) and not leak Fragment reference.
-- **SupervisorJob misuse:** Not observed in current Order Hub; if delivery introduces parallel flows (e.g. poll + webhook), use supervisor where appropriate.
-- **Unscoped coroutines:** Avoid `GlobalScope` or `CoroutineScope(IO).launch` without lifecycle; webhook handlers should be tied to Repository or Application.
-- **Flow cold/hot misuse:** Order list is cold Flow from use case; ensure delivery status updates (e.g. from webhook) emit via StateFlow/SharedFlow so UI collects once.
-- **Backpressure / Cancellation:** High-frequency webhook events should be throttled or conflated before updating UI state.
-- **Cancellation awareness:** Use case and repository suspend functions should respect cancellation; webhook processing should not hold references to destroyed UI.
+### 3. Data Model Changes
 
-### 2.3 Data Layer Review
+- **Commons / API model:** Extend `DeliveryEntity` (or equivalent) to include:
+  - `providerStatus` (String or enum: new, placed, enroute, arrived, delivered, cancelled)
+  - `deliveryId` (String, for dedupe)
+  - `vehicleType` (String, e.g. "Car")
+  - Optional: `driverArrivedAt`, `deliveredAt` for timestamps.
+- **OrderHubDto / OrderHubBO / OrderHubUI:** Add fields required for list and details:
+  - Driver: `driverStatus`, `driverName`, `driverPhone`, `vehicleType`
+  - Delivery: `deliveryId`, `providerStatus`, `scheduledDeliveryTime`, `deliveryInstructions`
+- **Room:** New columns (or JSON blob) for the above; **migration** and version bump. Ensure queries for `mainFilter = delivery` and subFilter use these fields where needed.
 
-- **Room queries performance:** `OrderHubNewDao` / `OrderHubDao`; ensure delivery filter (mainFilter=delivery) and new columns (e.g. driver_status, delivery_id, provider_status) are indexed or covered by existing queries; avoid N+1 when loading order list with delivery details.
-- **Index usage validation:** Confirm indexes on (orderType/serveType, orderStatus, ticketPaymentStatus) or equivalent for delivery tab queries.
-- **N+1 query risks:** If delivery metadata lives in a separate table, prefer single query with relation or embedded DTO to avoid per-order lookups.
-- **Transaction correctness:** Webhook-driven updates (e.g. provider status, driver assigned) must update local DB in a transaction where needed; avoid partial state.
-- **Migration readiness:** New columns (driver_status, provider_status, delivery_id, driver_phone, driver_name, etc.) require Room migration and version bump; document rollback.
-- **API error mapping:** Backend/DoorDash API errors must map to user-visible messages and retry strategy; duplicate events ignored by delivery_id.
+### 4. Delivery Orders Table (OrdersHubTicketsFragment)
 
-### 2.4 UI & State Management Review
+- **Columns** (align with PRD): Ticket No., Order ID, Order Time, Customer Name, Order Total, Order Status, **Driver Status**.
+- **Adapter:** Reuse **OrdersHubTicketAdapter** (or extend); add binding for **Driver Status** from `OrderHubUI.driverStatus`. Use **DiffUtil** or **ListAdapter** so webhook-driven updates do not recreate the whole list (avoids scroll loss and jank).
+- **Data source:** Same `GetAllOrdersUseCase` with `mainFilter = delivery` and `subFilter = Scheduled | Active | Ready | Complete | Cancelled`; Repository returns orders with driver/delivery fields populated from local DB (which is updated by API and webhooks).
 
-- **Single source of truth:** Order list and filters already in `OrderHubUiState`; add delivery-specific state (e.g. driver status per order, selected order for details) in same state or dedicated StateFlow; avoid duplicate state in Fragment.
-- **Immutable UI state:** Use data classes and `copy()` for state updates; expose `StateFlow`/`LiveData` read-only; avoid mutable public properties.
-- **StateFlow/LiveData misuse:** Order Hub uses StateFlow for uiState and SharedFlow for events; continue pattern for delivery events (e.g. driver arrived).
-- **One-time event handling:** Use SharedFlow or Event wrapper for one-time events (e.g. “driver arrived” toast); avoid re-emitting on config change.
-- **Configuration change safety:** ViewModel survives config change; ensure delivery state (selected tab, order list, driver status) is in ViewModel, not Fragment vars.
-- **Compose recomposition risks:** N/A (XML/View-based); if any Compose is introduced for delivery, avoid heavy logic in composables.
+### 5. Ticket Number Logic
 
-### 2.5 Performance & Memory Review
+- Keep existing rules: ticket numbers increment sequentially; assigned when order enters POS; displayed in list and details.
+- **Fallback:** If system Order ID is long, ticket number remains the primary visible identifier (no change).
 
-- **Large ViewModels:** OrdersHubViewModel already carries filter + orders; adding delivery fields should not duplicate full order list; consider paging if delivery order count is large.
-- **Memory leaks:** OrderInfoDialog and list item click callbacks must use viewLifecycleOwner or clear references on destroy; webhook listeners must unregister.
-- **Heavy object allocation:** Avoid creating large objects per webhook; prefer incremental state updates.
-- **Bitmap handling:** N/A for delivery feature.
-- **RecyclerView inefficiencies:** Reuse existing `OrdersHubTicketAdapter` pattern; use DiffUtil or ListAdapter for delivery list updates to avoid full refresh and scroll loss.
-- **Cold start impact:** Delivery tab data can load on demand when user selects Delivery filter; avoid loading all delivery orders at app start.
-- **Frame drops risk:** Webhook-driven list updates should post to Main and batch if needed; avoid heavy work on main thread.
+### 6. Order Details Panel (OrderInfoDialog)
 
-### 2.6 Reliability & Stability
+- **Existing:** Ticket number, Order ID, order time, items, total, customer name, phone, address; rider block (name, phone) from `ticketData.order?.delivery`.
+- **Add / extend:**
+  - **Delivery information:** Delivery instructions (from order); vehicle type (e.g. Car).
+  - **Driver status:** Show current driver status (Searching / Assigned / En Route / Arrived / Delivered).
+  - **Driver name and phone:** Shown when driver status is Assigned or later (per PRD); reuse/extend existing rider name and phone binding.
+- **OrderInfoDialog** should receive updated `TicketData` (or OrderHubUI) that includes delivery and driver fields; no business logic in Dialog, only display.
 
-- **Crash reports (last 30–90 days):** *[Check Firebase/Crashlytics for Orders Hub / orderhub / delivery]*  
-- **ANR reports:** *[Check for main-thread work in Order Hub]*  
-- **Unhandled exceptions:** Webhook payload parsing (e.g. DoorDash provider status) must be in try/catch; invalid or unknown status should not crash.  
-- **Error propagation strategy:** Define how webhook failures and API errors surface (snackbar, silent retry, status sync retry).  
-- **Retry logic correctness:** PRD specifies “POS retries status sync”; implement bounded retry with backoff for webhook delay scenarios.
+### 7. Webhook Handling
 
-### 2.7 Test Coverage Assessment
+- **Entry point:** Backend receives DoorDash Drive webhooks and forwards to POS (e.g. MQTT, SSE, or poll). Use existing pattern (e.g. MQTT/SSE handler) and add a **delivery-specific handler** that:
+  - Parses provider status and delivery_id.
+  - **Deduplication:** If event with same `delivery_id` already processed (e.g. in-memory set or DB), ignore.
+  - Runs on **IO dispatcher**; updates local DB (Repository or LocalDataSource) with provider_status, driver_status, driver name/phone if present.
+  - Notifies UI layer via existing Flow/StateFlow (e.g. refresh order list or emit update for single order) on **Main**.
+- **Scope:** Do not use unscoped coroutines or GlobalScope; tie to Repository or Application lifecycle so handlers do not hold Fragment/Activity references.
 
-- **Unit test coverage %:** *[Current Order Hub ViewModel/UseCase coverage]*  
-- **Integration test presence:** *[Order Hub repository/local DB tests]*  
-- **Flaky tests:** *[None identified]*  
-- **Missing edge-case tests:** Delivery-specific: driver not assigned, driver assigned after kitchen ready, driver arrives before order ready, duplicate webhooks, webhook delay.  
-- **Mocking anti-patterns:** Ensure webhook and API layers are mockable for unit tests.
+### 8. Tab Logic (Domain / Repository)
 
----
+- **Scheduled tab:** Orders where delivery is scheduled for future and prep window has not started (e.g. `scheduled_delivery_time - prep_time > now`). Show scheduled delivery time, customer, address, driver status (Searching or Assigned).
+- **In Kitchen:** Prep started or order on KDS; driver status can be Assigned or En Route.
+- **Ready:** Kitchen marked ready; driver status En Route or Arrived; show driver name and phone.
+- **Completed:** Provider status = delivered; show delivery completion timestamp, driver name, ticket number, total.
+- **Cancelled:** Provider status = cancelled; show cancellation timestamp and reason if provided; order must not appear in any other tab.
 
-## 3. Identified Issues Log
+Implement these rules when **querying** or **mapping** orders for each tab (in Repository or UseCase), so Fragment only binds to precomputed list.
 
-Document all findings clearly.
+### 9. Edge Cases (Implementation Notes)
 
-| Category | Issue Description | Severity | Risk Impact |
-|----------|-------------------|----------|--------------|
-| Architecture | Delivery lifecycle and provider-status → tab mapping logic could be implemented in Fragment | High | Hard to test, maintain, reuse |
-| Data | DeliveryEntity (commons) has name, phoneNumber but no provider_status, delivery_id, vehicle_type | Medium | Cannot support full PRD without model extension |
-| Data | No Room migration plan yet for delivery/driver columns | Medium | Blocking for persistence |
-| Concurrency | Webhook handling scope and threading not defined | Medium | ANR or leaks if done on main or unscoped |
-| UI | OrderInfoDialog shows rider info but not driver status (Searching/Assigned/EnRoute/Arrived/Delivered) or vehicle type | Medium | Incomplete UX per PRD |
-| Reliability | Duplicate webhook handling (by delivery_id) not implemented | Medium | Duplicate events could corrupt state |
-| Performance | Full list refresh on every webhook could cause scroll loss and jank | Medium | Bad UX |
-| Test | No automated tests for Delivery tab or driver status | Low | Regressions |
+- **Driver not assigned (new):** Show “Searching for Driver” in Driver Status column and in Order Info.
+- **Driver assigned after kitchen ready:** Order stays in Ready tab; driver info appears when webhook received.
+- **Driver arrives before order ready:** Show “Driver Waiting” (or “Driver Arrived”) in driver status; order remains in Ready when kitchen marks ready.
+- **Driver reassignment:** On webhook with same delivery_id and updated driver, update driver name, phone, status.
+- **Webhook delay:** Rely on “POS retries status sync” (periodic or on tab focus); show last known state until update received.
+- **Duplicate webhooks:** Ignore by `delivery_id` (and optionally event id if provided).
 
-*Additional issues may be added after deeper code review of OrderHubNewDao, webhook entry points, and OrderHubDataState usage.*
+### 10. Operational Constraints (Out of Scope V1)
 
----
-
-## 4. Improvement Decision Matrix (Mandatory)
-
-For each identified issue:
-
-| Issue | Fix in Current Iteration? (Y/N) | Justification | Backlog Ticket | Target Sprint |
-|-------|----------------------------------|---------------|----------------|---------------|
-| Lifecycle/tab mapping in domain | Y | Architectural; must be in UseCase/Repository for testability and single source of truth | *[Ref]* | *[Sprint]* |
-| Extend DeliveryEntity / DTO for provider_status, delivery_id, vehicle_type | Y | Required for PRD; backend/API contract must align | *[Ref]* | *[Sprint]* |
-| Room migration for delivery columns | Y | Required for persistence and rollback safety | *[Ref]* | *[Sprint]* |
-| Webhook scope and threading | Y | Concurrency governance; must fix | *[Ref]* | *[Sprint]* |
-| OrderInfoDialog driver status + vehicle | Y | PRD acceptance criteria | *[Ref]* | *[Sprint]* |
-| Dedupe by delivery_id | Y | PRD edge case | *[Ref]* | *[Sprint]* |
-| Incremental list updates (DiffUtil/ListAdapter) | Y (recommended) | Performance; avoid scroll loss | *[Ref]* | *[Sprint]* |
-| Delivery tab / driver status tests | N (recommended) | Add when scope allows | *[Ref]* | *[Sprint]* |
-
-**Governance Rules**
-
-- Crash, ANR, or memory leak → Must fix immediately  
-- Concurrency violation → Must fix  
-- Architectural violation → Explicit approval required  
-- Performance regression risk → Must be benchmarked  
-- No issue may be ignored without documentation  
+- Staff **cannot cancel** delivery orders from POS.
+- **No** driver ETA countdown.
+- Driver phone number **visible only after** driver is assigned (provider status = placed or later).
 
 ---
 
-## 5. Impact Assessment
+## Data Layer (Repository / LocalDataSource)
 
-### 5.1 UI Impact
+- **OrdersHubRepository** / **OrderHubLocalDataSource:**  
+  - Support `mainFilter = delivery` and subFilters (Scheduled, Active, Ready, Complete, Cancelled) with same pattern as 3PO.  
+  - Persist and query new delivery/driver columns; apply tab rules when building list (or expose raw list and map in UseCase).
+- **Webhook path:**  
+  - Parse DoorDash payload → map to provider_status and driver fields → update local entity by `delivery_id` (and ticket/order id).  
+  - Use transaction if updating multiple tables.  
+  - After update, trigger order list refresh or emit update (e.g. via Flow) so UI updates.
+- **API:**  
+  - Order list endpoint must return delivery orders with driver/delivery fields when requested (e.g. filter by fulfillment type = delivery).  
+  - Backend is responsible for receiving DoorDash webhooks and persisting; POS may poll or receive push (MQTT/SSE) for status sync — align with backend contract.
 
-- **Layout changes:** New or repurposed Delivery section in Orders Hub; Delivery tab already present in `OrderHubDataState.Delivery`; sub-tabs (Scheduled, In Kitchen, Ready, Completed, Cancelled) may reuse or extend existing sub-filter UI. Table columns: add **Driver Status** (and ensure Ticket No., Order ID, Order Time, Customer Name, Order Total, Order Status exist). Order Info popup: add/expand **Delivery Information** (instructions, driver name, phone, vehicle type) and **Driver Status**.
-- **Navigation changes:** No new activity; Delivery is a filter/tab within existing Orders Hub flow. Order details remain in OrderInfoDialog or equivalent.
-- **State handling modifications:** New state for driver status (and possibly provider_status) per order; tab state derived from lifecycle rules; use ViewModel and existing StateFlow pattern.
+### Enums and Types
 
-### 5.2 API Contract Impact
-
-- **Request/response changes:** Backend must support delivery orders and DoorDash Drive provider status (new/placed/enroute/arrived/delivered/cancelled); may require new endpoints or webhook payload schema. Order list API may need to return driver_status, delivery_id, driver_phone, driver_name, vehicle_type for delivery orders.
-- **Error model changes:** Define error codes for delivery provider errors and map to user messages.
-- **Versioning required:** Confirm backend/API version and webhook version compatibility.
-
-### 5.3 Database Impact
-
-- **Schema changes:** New or extended columns for delivery: e.g. provider_status, delivery_id, driver_status, driver_name, driver_phone, vehicle_type, delivery_instructions; possibly scheduled_delivery_time, prep_time for Scheduled tab logic.
-- **Migration needed:** Yes; add migration and bump DB version; test upgrade path.
-- **Data backfill required:** Not for existing non-delivery orders; new delivery orders populated via API/webhook.
-- **Rollback feasibility:** Migration must be reversible or forward-compatible so rollback does not crash on new columns.
-
-### 5.4 Performance Impact
-
-- **CPU impact:** Webhook parsing and state updates should be on background thread; minimal main-thread work.
-- **Memory footprint:** Avoid holding full order payloads in memory; use paging if list is large.
-- **Network payload size:** Delivery fields will increase payload size; monitor and optimize if needed.
-- **Startup time impact:** No change if delivery data is loaded only when Delivery tab is selected.
-- **Expected load increase:** Webhook volume depends on DoorDash Drive activity; throttle/conflate updates.
-
-### 5.5 Backward Compatibility
-
-- **Feature flags required:** Recommended to gate Delivery section and webhook handling for gradual rollout.
-- **Gradual rollout:** Per PRD; consider by restaurant or region.
-- **Legacy support maintained:** Existing 3PO (third-party) and other Order Hub tabs must continue to work; Delivery is additive.
+- **Provider status:** Use enum or sealed class (new, placed, enroute, arrived, delivered, cancelled) in domain and data layers; map to string for API/Room if needed.
+- **Driver status (display):** Use enum (Searching, Assigned, EnRoute, Arrived, Delivered, Cancelled) for UI consistency.
 
 ---
 
-## 6. Risk Assessment
+## Testing and QA
 
-| Risk | Probability | Impact | Mitigation Strategy |
-|------|-------------|--------|----------------------|
-| Webhook delay or failure | Medium | High | Retry status sync; show “Searching for driver” until placed; document timeout behavior |
-| Duplicate webhooks corrupt state | Medium | High | Dedupe by delivery_id; idempotent updates |
-| Tab transition logic wrong (e.g. Ready vs In Kitchen) | Medium | High | Implement and test per PRD rules; code review and QA |
-| Driver PII (phone) exposure | Low | High | Show only after assignment; comply with privacy policy |
-| Main-thread webhook handling | Low | High | Enforce IO dispatcher and lifecycle scope in code review |
-| Regression in existing 3PO/Order Hub | Medium | High | Feature flag; QA of All/ThirdParty/TakeOut/DineIn tabs |
-
-**Rollback strategy:** Feature flag to hide Delivery section and disable webhook handling; DB migration must not break existing app (nullable columns or compatible migration). Document steps to disable and re-enable.
-
-**Monitoring plan:** Log delivery webhook receipt and failures; monitor crash/ANR for Order Hub; alert on delivery sync failure rate or latency.
+- **Unit:** Repository/UseCase logic for tab mapping and provider_status → driver_status; dedupe by delivery_id.
+- **Integration:** Local DB update from webhook payload; order list for delivery tab returns correct subset.
+- **Manual QA:** Full lifecycle (scheduled → in kitchen → ready → delivered); driver assignment and phone visibility; Order Info popup; duplicate webhook does not change state; webhook delay then sync.
 
 ---
 
-## 11. Final Approval
+## Summary
 
-| Role | Approval |
-|------|----------|
-| Engineering Manager Approval | *[Name / Date / Signature]* |
-| Platform Lead Approval | *[Name / Date / Signature]* |
-| Squad Lead Approval | *[Name / Date / Signature]* |
-| Product Acknowledgment | *[Name / Date / Signature]* |
-| Date | *[Date]* |
+| Area | Action |
+|------|--------|
+| **UI** | Delivery tab (existing), add Driver Status column; extend OrderInfoDialog with delivery info and driver status. |
+| **State** | Keep in ViewModel (OrderHubUiState); driver/delivery fields on OrderHubUI. |
+| **Domain** | Tab and driver-status rules in Repository or UseCase; no logic in Fragment/Dialog. |
+| **Data** | Extend DeliveryEntity, DTO/BO/UI; Room migration; webhook handler with dedupe and IO scope. |
+| **Concurrency** | Webhook on IO; UI update on Main; lifecycle-safe scope. |
+
+This keeps the existing 3PO implementation intact and adds Delivery as a first-class fulfillment type with clear lifecycle and driver visibility, in line with the PRD and the Technical Assessment.
