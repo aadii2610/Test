@@ -1,166 +1,438 @@
-# Implementation Plan — Delivery Orders in Orders Hub (DoorDash Drive)
+# SharedRepository Migration Plan
 
-High-level solution guide for **Delivery order management** in POS Orders Hub. This fits alongside the existing **3PO (third-party)** implementation; the same Order Hub structure (filters, tabs, table, order details) is extended for delivery lifecycle and driver status.
+## Problem
 
----
+`Constants.kt` (mpos module) mixes two very different things:
 
-## Technical Debt Coverage
+- **True constants** — `const val` compile-time values that never change (URLs, key strings, port numbers). These are fine where they are.
+- **Mutable runtime state** — `var` fields and `MutableLiveData` instances that represent live app state (tokens, payment amounts, ticket data, etc.). These are currently global mutable singletons with no encapsulation, no clear ownership, and no testability.
 
-From the Technical Assessment doc, the following should be addressed **with** this feature where applicable:
-
-- **Delivery lifecycle and tab mapping in domain:** Implement in UseCase/Repository (or dedicated mapper), not in Fragment — *must fix in this iteration.*
-- **Webhook scope and threading:** Define and implement webhook handling on IO dispatcher with lifecycle-safe scope (Repository or Application) — *must fix.*
-- **Duplicate webhook handling:** Ignore duplicate events using `delivery_id` — *must fix.*
-- **List updates:** Use incremental updates (e.g. DiffUtil / ListAdapter or equivalent) when applying webhook-driven changes to avoid scroll loss and frame drops — *recommended in this iteration.*
+The mutable state is the problem. It is written and read from anywhere in the codebase with no injection boundary, making it hard to test, hard to reason about, and fragile across process recreation.
 
 ---
 
-## Architecture Point of View
+## Goal
 
-Current Order Hub follows:
+Move all **mutable runtime state** out of `Constants` into a `SharedRepository` singleton that is:
+- Injected via Hilt wherever needed
+- Mockable in tests
+- Logically grouped by domain
 
-**UI → ViewModel → UseCase → Repository → LocalDataSource / RemoteDataSource → API / Room / MQTT**
-
-- **OrdersHubTicketsFragment** / **OrdersHubParentActivity** → **OrdersHubViewModel** → **GetAllOrdersUseCase** / **OrderHubFilterUseCase** / **GeSingleTicketUseCase** → **OrdersHubRepository** / **OrderHubFilterRepository** → **OrderHubLocalDataSource**, **OrderHubRemoteDataSource**.
-- Keep this hierarchy. Do **not** introduce extra layers (e.g. a separate “DeliveryManager”) unless explicitly agreed; extend existing Repository and UseCase for delivery.
-- **OrderHubDataState** already has `Delivery`; sub-filters (Scheduled, Active/In Kitchen, Ready, Complete, Cancelled) already exist. Delivery-specific **tab semantics** (Scheduled / In Kitchen / Ready / Completed / Cancelled) map to these; driver status is an **additional dimension** shown in the table and details panel.
-
----
-
-## Deep Dive in Code
-
-### 1. Orders Hub — Delivery Section and Tabs
-
-- **Fulfillment filter:** User selects **Delivery** (existing `OrderHubDataState.Delivery` / `OrderHubTypesEnum.DELIVERY`) to show only orders created via online ordering and fulfilled through DoorDash Drive.
-- **Lifecycle tabs:** Use existing sub-filter semantics; map PRD tabs to current status/subFilter:
-  - **Scheduled** → `OrderHubDataState.Filter.Scheduled` (future delivery, prep not started).
-  - **In Kitchen** → `OrderHubDataState.Filter.Active` (for delivery: preparation window started / kitchen preparing).
-  - **Ready** → `OrderHubDataState.Filter.Ready` (kitchen marked ready, waiting for driver).
-  - **Completed** → `OrderHubDataState.Filter.Complete` (delivered).
-  - **Cancelled** → `OrderHubDataState.Filter.Cancelled`.
-- **Tab transition logic** (domain/repository or use case):
-  - Scheduled → In Kitchen: when `current_time >= scheduled_delivery_time - prep_time` (backend or local rule).
-  - In Kitchen → Ready: when kitchen/KDS marks order ready (existing flow).
-  - Ready → Completed: when provider status = `delivered`.
-  - Any → Cancelled: when provider status = `cancelled`.
-- **Single source of truth:** Tab placement is derived from **order status + provider status**; compute in UseCase or Repository when returning orders for a given (mainFilter=delivery, subFilter=X). Fragment only displays the list and selected tab.
-
-### 2. Delivery Provider Status Model
-
-- **Provider statuses** (from DoorDash Drive webhooks): `new`, `placed`, `enroute`, `arrived`, `delivered`, `cancelled`.
-- **Driver status (POS):** Map 1:1 for display:
-  - `new` → **Searching for Driver**
-  - `placed` → **Driver Assigned**
-  - `enroute` → **Driver En Route**
-  - `arrived` → **Driver Arrived** (or “Driver Waiting” if kitchen not ready)
-  - `delivered` → **Delivered**
-  - `cancelled` → **Cancelled**
-- **Provider status → POS tab:** As per PRD table (e.g. new/placed → Scheduled or In Kitchen; arrived → Ready; delivered → Completed; cancelled → Cancelled). Implement this mapping in **domain** (e.g. in Repository when persisting webhook payload, or in a mapper that computes `orderStatus` + tab eligibility).
-
-### 3. Data Model Changes
-
-- **Commons / API model:** Extend `DeliveryEntity` (or equivalent) to include:
-  - `providerStatus` (String or enum: new, placed, enroute, arrived, delivered, cancelled)
-  - `deliveryId` (String, for dedupe)
-  - `vehicleType` (String, e.g. "Car")
-  - Optional: `driverArrivedAt`, `deliveredAt` for timestamps.
-- **OrderHubDto / OrderHubBO / OrderHubUI:** Add fields required for list and details:
-  - Driver: `driverStatus`, `driverName`, `driverPhone`, `vehicleType`
-  - Delivery: `deliveryId`, `providerStatus`, `scheduledDeliveryTime`, `deliveryInstructions`
-- **Room:** New columns (or JSON blob) for the above; **migration** and version bump. Ensure queries for `mainFilter = delivery` and subFilter use these fields where needed.
-
-### 4. Delivery Orders Table (OrdersHubTicketsFragment)
-
-- **Columns** (align with PRD): Ticket No., Order ID, Order Time, Customer Name, Order Total, Order Status, **Driver Status**.
-- **Adapter:** Reuse **OrdersHubTicketAdapter** (or extend); add binding for **Driver Status** from `OrderHubUI.driverStatus`. Use **DiffUtil** or **ListAdapter** so webhook-driven updates do not recreate the whole list (avoids scroll loss and jank).
-- **Data source:** Same `GetAllOrdersUseCase` with `mainFilter = delivery` and `subFilter = Scheduled | Active | Ready | Complete | Cancelled`; Repository returns orders with driver/delivery fields populated from local DB (which is updated by API and webhooks).
-
-### 5. Ticket Number Logic
-
-- Keep existing rules: ticket numbers increment sequentially; assigned when order enters POS; displayed in list and details.
-- **Fallback:** If system Order ID is long, ticket number remains the primary visible identifier (no change).
-
-### 6. Order Details Panel (OrderInfoDialog)
-
-- **Existing:** Ticket number, Order ID, order time, items, total, customer name, phone, address; rider block (name, phone) from `ticketData.order?.delivery`.
-- **Add / extend:**
-  - **Delivery information:** Delivery instructions (from order); vehicle type (e.g. Car).
-  - **Driver status:** Show current driver status (Searching / Assigned / En Route / Arrived / Delivered).
-  - **Driver name and phone:** Shown when driver status is Assigned or later (per PRD); reuse/extend existing rider name and phone binding.
-- **OrderInfoDialog** should receive updated `TicketData` (or OrderHubUI) that includes delivery and driver fields; no business logic in Dialog, only display.
-
-### 7. Webhook Handling
-
-- **Entry point:** Backend receives DoorDash Drive webhooks and forwards to POS (e.g. MQTT, SSE, or poll). Use existing pattern (e.g. MQTT/SSE handler) and add a **delivery-specific handler** that:
-  - Parses provider status and delivery_id.
-  - **Deduplication:** If event with same `delivery_id` already processed (e.g. in-memory set or DB), ignore.
-  - Runs on **IO dispatcher**; updates local DB (Repository or LocalDataSource) with provider_status, driver_status, driver name/phone if present.
-  - Notifies UI layer via existing Flow/StateFlow (e.g. refresh order list or emit update for single order) on **Main**.
-- **Scope:** Do not use unscoped coroutines or GlobalScope; tie to Repository or Application lifecycle so handlers do not hold Fragment/Activity references.
-
-### 8. Tab Logic (Domain / Repository)
-
-- **Scheduled tab:** Orders where delivery is scheduled for future and prep window has not started (e.g. `scheduled_delivery_time - prep_time > now`). Show scheduled delivery time, customer, address, driver status (Searching or Assigned).
-- **In Kitchen:** Prep started or order on KDS; driver status can be Assigned or En Route.
-- **Ready:** Kitchen marked ready; driver status En Route or Arrived; show driver name and phone.
-- **Completed:** Provider status = delivered; show delivery completion timestamp, driver name, ticket number, total.
-- **Cancelled:** Provider status = cancelled; show cancellation timestamp and reason if provided; order must not appear in any other tab.
-
-Implement these rules when **querying** or **mapping** orders for each tab (in Repository or UseCase), so Fragment only binds to precomputed list.
-
-### 9. Edge Cases (Implementation Notes)
-
-- **Driver not assigned (new):** Show “Searching for Driver” in Driver Status column and in Order Info.
-- **Driver assigned after kitchen ready:** Order stays in Ready tab; driver info appears when webhook received.
-- **Driver arrives before order ready:** Show “Driver Waiting” (or “Driver Arrived”) in driver status; order remains in Ready when kitchen marks ready.
-- **Driver reassignment:** On webhook with same delivery_id and updated driver, update driver name, phone, status.
-- **Webhook delay:** Rely on “POS retries status sync” (periodic or on tab focus); show last known state until update received.
-- **Duplicate webhooks:** Ignore by `delivery_id` (and optionally event id if provided).
-
-### 10. Operational Constraints (Out of Scope V1)
-
-- Staff **cannot cancel** delivery orders from POS.
-- **No** driver ETA countdown.
-- Driver phone number **visible only after** driver is assigned (provider status = placed or later).
+True `const val` entries stay in `Constants.kt` — they are zero-cost compile-time values and need no change.
 
 ---
 
-## Data Layer (Repository / LocalDataSource)
+## What Moves vs What Stays
 
-- **OrdersHubRepository** / **OrderHubLocalDataSource:**  
-  - Support `mainFilter = delivery` and subFilters (Scheduled, Active, Ready, Complete, Cancelled) with same pattern as 3PO.  
-  - Persist and query new delivery/driver columns; apply tab rules when building list (or expose raw list and map in UseCase).
-- **Webhook path:**  
-  - Parse DoorDash payload → map to provider_status and driver fields → update local entity by `delivery_id` (and ticket/order id).  
-  - Use transaction if updating multiple tables.  
-  - After update, trigger order list refresh or emit update (e.g. via Flow) so UI updates.
-- **API:**  
-  - Order list endpoint must return delivery orders with driver/delivery fields when requested (e.g. filter by fulfillment type = delivery).  
-  - Backend is responsible for receiving DoorDash webhooks and persisting; POS may poll or receive push (MQTT/SSE) for status sync — align with backend contract.
+### Stays in `Constants.kt` (compile-time constants)
 
-### Enums and Types
+```
+const val BASE_URL, SSE_URL, REFRESH_TOKEN_URL, STRIPE_BASE
+const val KEY_USERID, KEY_USERNAME, KEY_ROLEID, KEY_ROLENAME, KEY_CLOCKED_IN, ...  (SharedPrefs keys)
+const val RESTAURANT_ID, TIME_ZONE, STORE_ID, IMAGE_URL, ... (other string keys)
+const val PORT, MAX_TICKETS_PER_ROW, MQTT_PORT, MAX_LOCATIONS
+const val MQTT_END_POINT, MQTT_END_POINT_INTERNAL, MQTT_END_POINT_POS, MQTT_END_POINT_PROD
+const val MAX_ATTEMPTS_PAYMENT_AUTH, DELAY_DURATION_AUTH
+const val CURRENCY, APK_FILE_NAME, MPOS, DEVICE_REVOKED, RE_ONBOARD, DEFAULT, INSTALLATION_ID
+const val HeaderItemType, LoyaltyItemType, HeaderItemTypeColumns, LoyaltyItemTypeColumns
+```
 
-- **Provider status:** Use enum or sealed class (new, placed, enroute, arrived, delivered, cancelled) in domain and data layers; map to string for API/Room if needed.
-- **Driver status (display):** Use enum (Searching, Assigned, EnRoute, Arrived, Delivered, Cancelled) for UI consistency.
+### Moves to `SharedRepository`
+
+| Domain group | Fields |
+|---|---|
+| **Auth / Session** | `SESSION_ID`, `BEARER_TOKEN`, `TENANT_ID`, `REFRESH_TOKEN`, `USER_ACCESS_TOKEN`, `USER_ID_TOKEN`, `RESET_USER_ID_TOKEN`, `M_POS_ID`, `USER_ID_STR`, `employeeName`, `USERID` |
+| **Payment state** | `discount`, `tax`, `subtotal`, `allDiscounts`, `total`, `tempSubtotal`, `paymentAmount`, `tenderName`, `tenderId`, `tenderIsTipAllowed`, `balanceDue`, `remainingBalance`, `cashTendered`, `changeDue`, `serviceCharge`, `taxRate`, `paymentId`, `rating`, `receiptName`, `emailAddress`, `phoneNumber`, `paymentStatus`, `paymentSummaryStatus`, `ticketId`, `paymentIntentId`, `pspReferenceIdAdyen`, `paymentMethod`, `paymentProvider`, `tipAmount`, `customTipAmount`, `partialPaid`, `paymentUtilObject`, `serviceChargeList` |
+| **Register / Table** | `SELECTEDTABLEID`, `TABLE_NUM`, `billType`, `guestChipClicked`, `selectedTicketId`, `ticketsByTableResponse`, `currentlySelectedTicketPos`, `currentTicket`, `TICKETSTATUS`, `CHANGEDTABLENUMBER`, `createTicketResponse`, `printersListResponse`, `terminalStatus`, `connectLocationId`, `AUTOGRATITUITYBOOL`, `LARGEPARTYSIZE` |
+| **Guest selection** | `currentlySelectedGuest`, `currentSelectedName`, `currentGuest` |
+| **Discount** | `discountType`, `ticketItemId`, `discountPercent`, `employeeDiscountPercent`, `discountPrice` |
+| **UI flags** | `TICKETS_REMAINING`, `IS_CARD_FRAG_VISIBLE`, `PROCESSPAYMENTDONE`, `isTipReceiptNavigationPending`, `isConnected`, `restaurantInfoFailed`, `loyaltyPoints` |
+| **LiveData events** | `tableChangeLiveData`, `setNewGuestLiveData`, `createNewGuestLiveData`, `isTableChanged`, `_menuItemLiveData`, `splitTicketRefreshLiveData`, `isMenuSheetVisibleEvent`, `discountPercentPaymentBool`, `employeeDiscountPercentPaymentBool`, `discountPricePaymentBool`, `callItemFragment` |
+| **Card / Adyen** | `cardDetailsPaymentIntent` |
 
 ---
 
-## Testing and QA
+## Interface Design
 
-- **Unit:** Repository/UseCase logic for tab mapping and provider_status → driver_status; dedupe by delivery_id.
-- **Integration:** Local DB update from webhook payload; order list for delivery tab returns correct subset.
-- **Manual QA:** Full lifecycle (scheduled → in kitchen → ready → delivered); driver assignment and phone visibility; Order Info popup; duplicate webhook does not change state; webhook delay then sync.
+Create the interface at:
+`mpos/src/main/java/aio/app/mpos/repositories/shared/SharedRepository.kt`
+
+```kotlin
+package aio.app.mpos.repositories.shared
+
+import aio.app.commons.datamodels.adyen.CardDetails
+import aio.app.commons.datamodels.posTicketItems.TicketData
+import aio.app.commons.datamodels.posTicketItems.servicecharges.ServiceChargeModel
+import aio.app.commons.utils.PaymentUtilObject
+import aio.app.mpos.datamodels.deviceresponse.GetPosDevicesResponse
+import aio.app.mpos.datamodels.ticket.CreateTicketResponse
+import aio.app.mpos.datamodels.ticket.TicketResponse
+import androidx.lifecycle.MutableLiveData
+
+interface SharedRepository {
+
+    // --- Auth / Session ---
+    var sessionId: String
+    var bearerToken: String
+    var tenantId: Int
+    var refreshToken: String
+    var userAccessToken: String
+    var userIdToken: String
+    var resetUserIdToken: String
+    var mPosId: Int
+    var userIdStr: String
+    var employeeName: String
+    var userId: String
+
+    // --- Payment ---
+    var discount: Double
+    var tax: Double
+    var subtotal: Double
+    var allDiscounts: Double
+    var total: Double
+    var tempSubtotal: Double
+    var paymentAmount: Double
+    var tenderName: String
+    var tenderId: Int
+    var tenderIsTipAllowed: Boolean
+    var balanceDue: Double
+    var remainingBalance: Double
+    var cashTendered: Double
+    var changeDue: Double
+    var serviceCharge: Double
+    var taxRate: Double
+    var paymentId: Int
+    var rating: Int
+    var receiptName: String
+    var emailAddress: String
+    var phoneNumber: String
+    var paymentStatus: String
+    var paymentSummaryStatus: String
+    var ticketId: String
+    var paymentIntentId: String?
+    var pspReferenceIdAdyen: String
+    var paymentMethod: String
+    var paymentProvider: String?
+    var tipAmount: Double
+    var customTipAmount: Double
+    var partialPaid: Boolean
+    var paymentUtilObject: PaymentUtilObject
+    var serviceChargeList: ArrayList<ServiceChargeModel>
+    var cardDetailsPaymentIntent: CardDetails
+
+    // --- Register / Table ---
+    var selectedTableId: Int
+    var tableNum: Int
+    var billType: String
+    var guestChipClicked: Int
+    var selectedTicketId: Int
+    var ticketsByTableResponse: TicketResponse
+    var currentlySelectedTicketPos: Int
+    var currentTicket: TicketData
+    var ticketStatus: String
+    var changedTableNumber: String
+    var createTicketResponse: CreateTicketResponse
+    var printersListResponse: GetPosDevicesResponse?
+    var terminalStatus: String
+    var connectLocationId: String?
+    var autoGratuityBool: Boolean
+    var largePartySize: Int
+
+    // --- Guest ---
+    var currentlySelectedGuest: ArrayList<String>
+    var currentSelectedName: String
+    var currentGuest: String
+
+    // --- Discount ---
+    var discountType: String
+    var ticketItemId: Int
+    var discountPercent: Double
+    var employeeDiscountPercent: Double
+    var discountPrice: Double
+
+    // --- UI flags ---
+    var ticketsRemaining: Boolean
+    var isCardFragVisible: Boolean
+    var processPaymentDone: Boolean
+    var isTipReceiptNavigationPending: Boolean
+    var isConnected: Boolean
+    var restaurantInfoFailed: Boolean
+    var loyaltyPoints: Int
+
+    // --- LiveData events ---
+    val tableChangeLiveData: MutableLiveData<Boolean>
+    val setNewGuestLiveData: MutableLiveData<Boolean>
+    val createNewGuestLiveData: MutableLiveData<Boolean>
+    val isTableChanged: MutableLiveData<Boolean>
+    val menuItemLiveData: MutableLiveData<Boolean>
+    val splitTicketRefreshLiveData: MutableLiveData<Boolean>
+    val isMenuSheetVisibleEvent: MutableLiveData<Boolean>
+    val discountPercentPaymentBool: MutableLiveData<Boolean>
+    val employeeDiscountPercentPaymentBool: MutableLiveData<Boolean>
+    val discountPricePaymentBool: MutableLiveData<Boolean>
+    val callItemFragment: MutableLiveData<Boolean>
+
+    // --- Utility ---
+    fun resetPaymentState()
+    fun resetSessionState()
+}
+```
 
 ---
 
-## Summary
+## Implementation
 
-| Area | Action |
-|------|--------|
-| **UI** | Delivery tab (existing), add Driver Status column; extend OrderInfoDialog with delivery info and driver status. |
-| **State** | Keep in ViewModel (OrderHubUiState); driver/delivery fields on OrderHubUI. |
-| **Domain** | Tab and driver-status rules in Repository or UseCase; no logic in Fragment/Dialog. |
-| **Data** | Extend DeliveryEntity, DTO/BO/UI; Room migration; webhook handler with dedupe and IO scope. |
-| **Concurrency** | Webhook on IO; UI update on Main; lifecycle-safe scope. |
+Create at:
+`mpos/src/main/java/aio/app/mpos/repositories/shared/SharedRepositoryImpl.kt`
 
-This keeps the existing 3PO implementation intact and adds Delivery as a first-class fulfillment type with clear lifecycle and driver visibility, in line with the PRD and the Technical Assessment.
+```kotlin
+package aio.app.mpos.repositories.shared
+
+import aio.app.commons.datamodels.adyen.CardDetails
+import aio.app.commons.datamodels.posTicketItems.TicketData
+import aio.app.commons.datamodels.posTicketItems.servicecharges.ServiceChargeModel
+import aio.app.commons.utils.PaymentUtilObject
+import aio.app.mpos.datamodels.deviceresponse.GetPosDevicesResponse
+import aio.app.mpos.datamodels.ticket.CreateTicketResponse
+import aio.app.mpos.datamodels.ticket.TicketResponse
+import androidx.lifecycle.MutableLiveData
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class SharedRepositoryImpl @Inject constructor() : SharedRepository {
+
+    // Auth
+    override var sessionId = ""
+    override var bearerToken = ""
+    override var tenantId = -1
+    override var refreshToken = ""
+    override var userAccessToken = ""
+    override var userIdToken = ""
+    override var resetUserIdToken = ""
+    override var mPosId = -1
+    override var userIdStr = ""
+    override var employeeName = ""
+    override var userId = ""
+
+    // Payment
+    override var discount = 0.0
+    override var tax = 0.0
+    override var subtotal = 0.0
+    override var allDiscounts = 0.0
+    override var total = 0.0
+    override var tempSubtotal = 0.0
+    override var paymentAmount = 0.0
+    override var tenderName = ""
+    override var tenderId = -1
+    override var tenderIsTipAllowed = false
+    override var balanceDue = 0.0
+    override var remainingBalance = 0.0
+    override var cashTendered = 0.0
+    override var changeDue = 0.0
+    override var serviceCharge = 0.0
+    override var taxRate = 0.0
+    override var paymentId = 0
+    override var rating = 0
+    override var receiptName = ""
+    override var emailAddress = ""
+    override var phoneNumber = ""
+    override var paymentStatus = ""
+    override var paymentSummaryStatus = ""
+    override var ticketId = ""
+    override var paymentIntentId: String? = null
+    override var pspReferenceIdAdyen = ""
+    override var paymentMethod = ""
+    override var paymentProvider: String? = null
+    override var tipAmount = 0.0
+    override var customTipAmount = 0.0
+    override var partialPaid = false
+    override var paymentUtilObject = PaymentUtilObject()
+    override var serviceChargeList = ArrayList<ServiceChargeModel>()
+    override var cardDetailsPaymentIntent = CardDetails()
+
+    // Register / Table
+    override var selectedTableId = -1
+    override var tableNum = -1
+    override var billType = "Shared"
+    override var guestChipClicked = 0
+    override var selectedTicketId = -1
+    override var ticketsByTableResponse = TicketResponse()
+    override var currentlySelectedTicketPos = 0
+    override var currentTicket = TicketData()
+    override var ticketStatus = ""
+    override var changedTableNumber = ""
+    override var createTicketResponse = CreateTicketResponse()
+    override var printersListResponse: GetPosDevicesResponse? = null
+    override var terminalStatus = ""
+    override var connectLocationId: String? = null
+    override var autoGratuityBool = false
+    override var largePartySize = -1
+
+    // Guest
+    override var currentlySelectedGuest = ArrayList<String>()
+    override var currentSelectedName = ""
+    override var currentGuest = ""
+
+    // Discount
+    override var discountType = ""
+    override var ticketItemId = -1
+    override var discountPercent = 0.0
+    override var employeeDiscountPercent = 0.0
+    override var discountPrice = 0.0
+
+    // UI flags
+    override var ticketsRemaining = false
+    override var isCardFragVisible = false
+    override var processPaymentDone = false
+    override var isTipReceiptNavigationPending = false
+    override var isConnected = false
+    override var restaurantInfoFailed = false
+    override var loyaltyPoints = 0
+
+    // LiveData
+    override val tableChangeLiveData = MutableLiveData<Boolean>()
+    override val setNewGuestLiveData = MutableLiveData<Boolean>()
+    override val createNewGuestLiveData = MutableLiveData<Boolean>()
+    override val isTableChanged = MutableLiveData<Boolean>()
+    override val menuItemLiveData = MutableLiveData<Boolean>()
+    override val splitTicketRefreshLiveData = MutableLiveData<Boolean>()
+    override val isMenuSheetVisibleEvent = MutableLiveData<Boolean>()
+    override val discountPercentPaymentBool = MutableLiveData<Boolean>()
+    override val employeeDiscountPercentPaymentBool = MutableLiveData<Boolean>()
+    override val discountPricePaymentBool = MutableLiveData<Boolean>()
+    override val callItemFragment = MutableLiveData<Boolean>()
+
+    override fun resetPaymentState() {
+        discount = 0.0; tax = 0.0; subtotal = 0.0; allDiscounts = 0.0; total = 0.0
+        tempSubtotal = 0.0; paymentAmount = 0.0; tenderName = ""; tenderId = -1
+        tenderIsTipAllowed = false; balanceDue = 0.0; remainingBalance = 0.0
+        cashTendered = 0.0; changeDue = 0.0; serviceCharge = 0.0; taxRate = 0.0
+        paymentId = 0; rating = 0; receiptName = ""; emailAddress = ""; phoneNumber = ""
+        paymentStatus = ""; paymentSummaryStatus = ""; ticketId = ""
+        paymentIntentId = null; pspReferenceIdAdyen = ""; paymentMethod = ""
+        paymentProvider = null; tipAmount = 0.0; customTipAmount = 0.0
+        partialPaid = false; paymentUtilObject = PaymentUtilObject()
+        serviceChargeList = ArrayList(); cardDetailsPaymentIntent = CardDetails()
+        processPaymentDone = false; isTipReceiptNavigationPending = false
+    }
+
+    override fun resetSessionState() {
+        sessionId = ""; bearerToken = ""; tenantId = -1; refreshToken = ""
+        userAccessToken = ""; userIdToken = ""; resetUserIdToken = ""; mPosId = -1
+        userIdStr = ""; employeeName = ""; userId = ""
+    }
+}
+```
+
+---
+
+## DI Registration
+
+Add a binding in `RepositoryModule.kt`:
+
+```kotlin
+// In the existing RepositoryModule (SingletonComponent)
+@Binds
+@Singleton
+abstract fun bindSharedRepository(
+    sharedRepositoryImpl: SharedRepositoryImpl
+): SharedRepository
+```
+
+No changes needed to `CoreModule` or `NetworkModule`.
+
+---
+
+## Usage — Before vs After
+
+### Before
+```kotlin
+// In a ViewModel or Fragment — direct global mutation
+Constants.BEARER_TOKEN = token
+Constants.discount = 12.5
+Constants.tableChangeLiveData.postValue(true)
+```
+
+### After
+```kotlin
+@HiltViewModel
+class CheckoutViewModel @Inject constructor(
+    private val repo: Repository,
+    private val sharedRepo: SharedRepository   // <-- inject here
+) : ViewModel() {
+
+    fun applyDiscount(amount: Double) {
+        sharedRepo.discount = amount
+        sharedRepo.discountPercentPaymentBool.postValue(true)
+    }
+
+    fun onTableChanged() {
+        sharedRepo.tableChangeLiveData.postValue(true)
+    }
+}
+```
+
+For Fragments that observe LiveData but don't need to write state, only inject `SharedRepository` via the ViewModel — the Fragment observes through the ViewModel, not directly.
+
+---
+
+## Migration Strategy
+
+Because `Constants` is referenced in many places, a full cut-over in one PR would be too risky. The recommended approach is:
+
+### Phase 1 — Add the repo, keep Constants working (no breakage)
+1. Create `SharedRepository` interface + `SharedRepositoryImpl`.
+2. Register in `RepositoryModule`.
+3. Do **not** delete anything from `Constants.kt` yet.
+4. In new code, write to `SharedRepository` only.
+
+### Phase 2 — Migrate one domain group at a time
+Migrate in this order (lowest blast radius first):
+1. Auth/Session fields — written in login flow only
+2. Discount fields — isolated to discount fragments
+3. Guest/Table fields — used by register screens
+4. Payment fields — broadest usage, do last
+
+For each group:
+- Find all reads/writes via `grep -r "Constants\.<fieldName>"`.
+- Replace writes with `sharedRepo.<field> = ...` in the owning ViewModel.
+- Replace reads with `sharedRepo.<field>` wherever the class already has `SharedRepository` injected.
+- Delete the field from `Constants.kt` once all call sites are gone.
+
+### Phase 3 — Remove Constants mutable state entirely
+After all `var` fields are migrated, `Constants.kt` becomes a pure `const val` object. At this point:
+- Rename it to something like `AppKeys.kt` or `AppConfig.kt` if desired.
+- Remove the `object` wrapper if you prefer top-level `const val` declarations.
+
+---
+
+## Commons Module Constants
+
+`commons/src/main/java/aio/app/commons/utils/Constants.kt` contains:
+- All view-height `const val` — leave them, they are true constants.
+- `var DATEFORMAT` and `var taxListCustom` — these are mutable and could move to a commons-level `SharedRepository`, but since the commons module has no DI of its own it is simpler to keep them as-is or pass them via function parameters when needed.
+
+---
+
+## Testing Benefit
+
+With `SharedRepository` as an interface, tests can provide a fake:
+
+```kotlin
+class FakeSharedRepository : SharedRepository {
+    override var bearerToken = "test-token"
+    override var discount = 0.0
+    // ... set only what the test needs
+}
+
+@Test
+fun `checkout applies discount correctly`() {
+    val fake = FakeSharedRepository()
+    val vm = CheckoutViewModel(fakeRepo, fake)
+    vm.applyDiscount(10.0)
+    assertEquals(10.0, fake.discount)
+}
+```
+
+This is impossible with the current static `Constants` object.
