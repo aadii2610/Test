@@ -1,438 +1,246 @@
-# SharedRepository Migration Plan
+# RefundMainFragment: Manual View-Switching to Nested NavGraph Migration
 
-## Problem
-
-`Constants.kt` (mpos module) mixes two very different things:
-
-- **True constants** — `const val` compile-time values that never change (URLs, key strings, port numbers). These are fine where they are.
-- **Mutable runtime state** — `var` fields and `MutableLiveData` instances that represent live app state (tokens, payment amounts, ticket data, etc.). These are currently global mutable singletons with no encapsulation, no clear ownership, and no testability.
-
-The mutable state is the problem. It is written and read from anywhere in the codebase with no injection boundary, making it hard to test, hard to reason about, and fragile across process recreation.
+**Area:** `pos/src/main/java/aio/app/pos/ui/main/fragments/refund/`
+**Status:** Proposed (not started)
+**Scope:** Presentation/navigation layer only -- no business logic, calculations, API contracts, or analytics/logging calls change.
 
 ---
 
-## Goal
+## Context
 
-Move all **mutable runtime state** out of `Constants` into a `SharedRepository` singleton that is:
-- Injected via Hilt wherever needed
-- Mockable in tests
-- Logically grouped by domain
+`RefundMainFragment` is hosted by `PaymentParentFragment` via a plain `childFragmentManager` transaction (`setRefundMainFragment()` / `clearRefundMainFragment()` in `PaymentParentFragment.kt:685-720`), replacing `payByCashFragmentContainer`. It is **not** currently part of any Navigation Component graph -- it's a manually managed child fragment, and this migration does not change that boundary.
 
-True `const val` entries stay in `Constants.kt` — they are zero-cost compile-time values and need no change.
+Inside `RefundMainFragment`, six "steps" are implemented as custom `View` subclasses (not Fragments), all inflated up front in `onCreateView()` and added to a single container (`binding.addView`, see `fragment_refund_main.xml:28-36`):
+
+| Step (current class) | Extends | Binding | Lines |
+|---|---|---|---|
+| `PaymentSelectionView` | `RelativeLayout` | `PaymentSelectionViewBinding` | 88 |
+| `RefundAmountSelectionView` | (ViewGroup) | `RefundAmountSelectionBinding` | 871 |
+| `RefundReasonView` | `RelativeLayout` | `RefundReasonViewBinding` | 29 |
+| `RefundConfirmationView` | `RelativeLayout` | `RefundConfirmationViewBinding` | 21 |
+| `RefundCompleteView` | `RelativeLayout` | `RefundCompleteViewBinding` | 20 |
+| `CancelOrderView` | `RelativeLayout` | `CancelOrderViewBinding` | ~30 |
+
+`RefundMainFragment` (2362 lines) owns:
+- All six view instances and toggles `visibility = VISIBLE/GONE` to move between them (`hideAllViews()`, and the show-calls scattered through `clickListeners()`, `handleBackButtonClick()`, `cardRefund()`, `cashRefund()`).
+- All cross-step mutable state as plain fields: `reason`, `refundedAmount`, `refundedTax`, `refundedTip`, `refundedRiderTip`, `refundedServiceCharges`, `refundedGratuity`, `refundedDeliveryFee`, `refundDateTime`, `refundableAmount`.
+- Four booleans standing in for "current step": `paymentSelection`, `refundReason`, `refundConfirmation`, `refundAmountSelection`, plus two init-guard booleans (`isPaymentSelectionViewInitialized`, `isRefundAmountSelectionViewInitialized`).
+- All business logic: `cardRefund()`, `cashRefund()`, `getPaymentRefundId()`, `movingBack()`, proportional recalculation helpers, New Relic logging, Analytics calls, SSE broadcast receiver (`onResume`/`onPause`), `OnReceiptCallback` (for SMS/Email screens launched via `RegisterActivity`).
+- Direct reach-into-child-view-internals coupling, e.g. `refundReasonView!!.binding.rBtnFive.isChecked`, `refundAmountSelectionView?.binding?.rAmountET?.text` -- the parent fragment freely pokes at every child's binding.
+
+This is documented in the companion discussion; this document is the concrete migration plan.
 
 ---
 
-## What Moves vs What Stays
+## Goals
 
-### Stays in `Constants.kt` (compile-time constants)
+1. Replace the six manually-toggled `View`s with six Fragments hosted in a nested `NavHostFragment`, using a real back stack instead of the boolean-flag chain.
+2. Preserve **every** existing behavior exactly: all calculations, API calls, analytics events, New Relic logs, receipt/print/SMS/email flows, the online-order-cancellation branch, and every back-button edge case.
+3. Do it incrementally, screen by screen, so each step is independently verifiable against the live (money-handling) flow.
+4. Leave `PaymentParentFragment`'s hosting of `RefundMainFragment` untouched -- this migration is entirely internal to `RefundMainFragment`.
+
+## Non-Goals
+
+- No change to `cardRefund()` / `cashRefund()` business logic, request payloads, or backend contracts.
+- No change to `RefundAmountSelectionView`'s calculation logic (proportional reductions, tax recalculation) -- only how it's hosted.
+- No change to how `RefundMainFragment` itself is created/destroyed by `PaymentParentFragment`.
+- Not a rewrite of `RefundAmountSelectionView`'s internals (871 lines) -- it moves into a Fragment wrapper as-is.
+
+---
+
+## Target Architecture
 
 ```
-const val BASE_URL, SSE_URL, REFRESH_TOKEN_URL, STRIPE_BASE
-const val KEY_USERID, KEY_USERNAME, KEY_ROLEID, KEY_ROLENAME, KEY_CLOCKED_IN, ...  (SharedPrefs keys)
-const val RESTAURANT_ID, TIME_ZONE, STORE_ID, IMAGE_URL, ... (other string keys)
-const val PORT, MAX_TICKETS_PER_ROW, MQTT_PORT, MAX_LOCATIONS
-const val MQTT_END_POINT, MQTT_END_POINT_INTERNAL, MQTT_END_POINT_POS, MQTT_END_POINT_PROD
-const val MAX_ATTEMPTS_PAYMENT_AUTH, DELAY_DURATION_AUTH
-const val CURRENCY, APK_FILE_NAME, MPOS, DEVICE_REVOKED, RE_ONBOARD, DEFAULT, INSTALLATION_ID
-const val HeaderItemType, LoyaltyItemType, HeaderItemTypeColumns, LoyaltyItemTypeColumns
+RefundMainFragment (unchanged role: host + orchestrator)
+├── refundHeaderView (unchanged, include layout)
+├── btnBackRefund (unchanged, single back button -- now delegates to child NavController)
+└── refundNavHostContainer (NEW -- replaces "addView" ConstraintLayout)
+        └── NavHostFragment (app:navGraph="@navigation/refund_nav_graph")
+                ├── PaymentSelectionFragment
+                ├── RefundAmountSelectionFragment
+                ├── RefundReasonFragment
+                ├── RefundConfirmationFragment
+                ├── RefundCompleteFragment
+                └── CancelOrderFragment
 ```
 
-### Moves to `SharedRepository`
+`RefundMainFragment` **keeps** its current responsibilities: it still owns `cardRefund()`, `cashRefund()`, `movingBack()`, the SSE broadcast receiver, `OnReceiptCallback`, and all logging/analytics. It becomes the **flow orchestrator holding the child `NavController`**, reacting to shared state changes and driving navigation -- it just stops manually toggling `View.GONE/VISIBLE` and instead calls `navController.navigate(...)`.
 
-| Domain group | Fields |
+Each new Fragment takes over exactly what its View counterpart did: inflate its own binding, wire its own click listeners for **purely local** UI concerns (radio button mutual exclusion, checkbox toggles, recycler view adapters), and read/write shared flow state through a new `RefundFlowViewModel` instead of through `RefundMainFragment` fields.
+
+### New class: `RefundFlowViewModel`
+
+A `ViewModel` scoped to `RefundMainFragment` (`by viewModels()` in `RefundMainFragment`, `by viewModels({ requireParentFragment() })` in each child Fragment -- **not** Activity-scoped, so it's created/cleared with the refund flow exactly like the current fields are).
+
+Holds what are today loose fields on `RefundMainFragment`:
+
+```kotlin
+class RefundFlowViewModel : ViewModel() {
+    var reason: String? = null
+    var refundedAmount = 0.00
+    var refundedTax = 0.00
+    var refundedTip = 0.00
+    var refundedRiderTip = 0.00
+    var refundedServiceCharges = 0.00
+    var refundedGratuity = 0.00
+    var refundedDeliveryFee = 0.00
+    var refundDateTime = ""
+    var refundableAmount: Double = 0.0
+    var isPaymentSelectionViewInitialized = false
+    var isRefundAmountSelectionViewInitialized = false
+}
+```
+
+This is the mechanism that lets child Fragments read/write "flow state" without holding a reference back to `RefundMainFragment` (today's `refundReasonView!!.binding...` pattern is replaced by each Fragment reading its own `binding` and writing into `RefundFlowViewModel`). All existing Activity-scoped ViewModels (`MainViewModel`, `PaymentViewModel`, `TicketViewModel`, `BusinessIdViewModel`) are obtained by each child Fragment the same way `RefundMainFragment` obtains them today (`activityViewModels()` / `viewModels()`) -- no change there.
+
+---
+
+## File-by-File Mapping
+
+| Old (View, self-managed visibility) | New (Fragment, nav destination) | Layout reuse |
+|---|---|---|
+| `PaymentSelectionView.kt` | `PaymentSelectionFragment.kt` | Reuse `PaymentSelectionViewBinding`'s layout XML as the fragment's layout |
+| `RefundAmountSelectionView.kt` | `RefundAmountSelectionFragment.kt` | Reuse `RefundAmountSelectionBinding`'s layout XML |
+| `RefundReasonView.kt` | `RefundReasonFragment.kt` | Reuse `RefundReasonViewBinding`'s layout XML |
+| `RefundConfirmationView.kt` | `RefundConfirmationFragment.kt` | Reuse `RefundConfirmationViewBinding`'s layout XML |
+| `RefundCompleteView.kt` | `RefundCompleteFragment.kt` | Reuse `RefundCompleteViewBinding`'s layout XML |
+| `CancelOrderView.kt` | `CancelOrderFragment.kt` | Reuse `CancelOrderViewBinding`'s layout XML |
+
+Each new Fragment's `onCreateView` uses the *same* generated `ViewBinding` class the old View used (`XxxBinding.inflate(inflater, container, false)`) -- the XML layouts themselves do not need to change, only the Kotlin class wrapping them (`RelativeLayout` subclass → `Fragment`).
+
+`fragment_refund_main.xml` changes from:
+
+```xml
+<androidx.constraintlayout.widget.ConstraintLayout
+    android:id="@+id/addView"
+    ... />
+```
+
+to:
+
+```xml
+<fragment
+    android:id="@+id/refundNavHostFragment"
+    android:name="androidx.navigation.fragment.NavHostFragment"
+    app:navGraph="@navigation/refund_nav_graph"
+    app:defaultNavHost="false"
+    ... />
+```
+
+`app:defaultNavHost="false"` is deliberate: `RefundMainFragment`'s existing `OnBackPressedCallback` (registered in `onViewCreated`, `RefundMainFragment.kt:322-329`) stays the single source of truth for back-press handling (see "Back Navigation" below) rather than letting the child `NavHostFragment` intercept system back on its own.
+
+---
+
+## Handling the Two Dynamic/Conditional Flows
+
+This is the part of the current code most likely to regress if migrated carelessly -- both flows pick their *first* screen based on data that isn't known until an `IO` dispatch resolves, which is why the current implementation waits until `onCreateView` runs a suspend function before deciding what to show.
+
+### 1. Cancel-order vs. normal refund (`RefundMainFragment.kt:239`)
+
+```kotlin
+if (cancelOnlineDeliveryOrder) inflateCancelOrderView()
+else lifecycleScope.launch { inflateRefundViews() }
+```
+
+This is a constructor-time argument (`ARG_SHOW_CANCEL_VIEW`), known synchronously. In the nav graph, this is **not** encoded as `app:startDestination` (a fixed XML attribute) -- instead, `RefundMainFragment` sets the graph's start destination in code, before the `NavHostFragment` is shown, mirroring how `newInstance(showCancelView)` already decides this today:
+
+```kotlin
+val navHostFragment = childFragmentManager.findFragmentById(R.id.refundNavHostFragment) as NavHostFragment
+val navController = navHostFragment.navController
+val graph = navController.navInflater.inflate(R.navigation.refund_nav_graph)
+graph.setStartDestination(
+    if (cancelOnlineDeliveryOrder) R.id.cancelOrderFragment else R.id.refundLoadingPlaceholder
+)
+navController.graph = graph
+```
+
+### 2. Single-payment vs. multi-payment start screen (`inflateRefundViews()`, `RefundMainFragment.kt:595-646`)
+
+Today, after an `IO` fetch of ticket data, the code decides between showing `PaymentSelectionView` (multiple payments / split items) or jumping straight to `RefundAmountSelectionView` (single payment) -- this can't be known synchronously, so it can't be the graph's static start destination either.
+
+**Solution:** add a lightweight, invisible `RefundLoadingFragment` as the graph's actual `app:startDestination` for the normal-refund branch. It does no rendering -- `onViewCreated` runs the same suspend check `inflateRefundViews()` does today, then calls:
+
+```kotlin
+navController.navigate(
+    if (multiplePaymentsOrSplit) R.id.action_loading_to_paymentSelection
+    else R.id.action_loading_to_amountSelection,
+    args,
+    navOptions { popUpTo(R.id.refundLoadingPlaceholder) { inclusive = true } }
+)
+```
+
+`popUpTo(...) { inclusive = true }` removes the placeholder from the back stack, so once the real first screen is showing, pressing back from it pops to *nothing* (matching today's behavior where back from the true first screen exits the whole flow, not "back to a loading screen").
+
+This keeps 100% of the existing decision logic (`selectedPayment.size > 1 || isItemSplited`) -- it just moves the "then what" from `paymentSelectionView?.visibility = View.VISIBLE` to `navController.navigate(...)`.
+
+---
+
+## Back Navigation Mapping
+
+`RefundMainFragment`'s current `handleBackButtonClick()` (lines 255-304) is a boolean-flag priority chain. Every branch maps directly onto `NavController` back-stack behavior, which is the strongest evidence this migration is low-risk for behavior parity:
+
+| Current boolean-flag branch | New behavior |
 |---|---|
-| **Auth / Session** | `SESSION_ID`, `BEARER_TOKEN`, `TENANT_ID`, `REFRESH_TOKEN`, `USER_ACCESS_TOKEN`, `USER_ID_TOKEN`, `RESET_USER_ID_TOKEN`, `M_POS_ID`, `USER_ID_STR`, `employeeName`, `USERID` |
-| **Payment state** | `discount`, `tax`, `subtotal`, `allDiscounts`, `total`, `tempSubtotal`, `paymentAmount`, `tenderName`, `tenderId`, `tenderIsTipAllowed`, `balanceDue`, `remainingBalance`, `cashTendered`, `changeDue`, `serviceCharge`, `taxRate`, `paymentId`, `rating`, `receiptName`, `emailAddress`, `phoneNumber`, `paymentStatus`, `paymentSummaryStatus`, `ticketId`, `paymentIntentId`, `pspReferenceIdAdyen`, `paymentMethod`, `paymentProvider`, `tipAmount`, `customTipAmount`, `partialPaid`, `paymentUtilObject`, `serviceChargeList` |
-| **Register / Table** | `SELECTEDTABLEID`, `TABLE_NUM`, `billType`, `guestChipClicked`, `selectedTicketId`, `ticketsByTableResponse`, `currentlySelectedTicketPos`, `currentTicket`, `TICKETSTATUS`, `CHANGEDTABLENUMBER`, `createTicketResponse`, `printersListResponse`, `terminalStatus`, `connectLocationId`, `AUTOGRATITUITYBOOL`, `LARGEPARTYSIZE` |
-| **Guest selection** | `currentlySelectedGuest`, `currentSelectedName`, `currentGuest` |
-| **Discount** | `discountType`, `ticketItemId`, `discountPercent`, `employeeDiscountPercent`, `discountPrice` |
-| **UI flags** | `TICKETS_REMAINING`, `IS_CARD_FRAG_VISIBLE`, `PROCESSPAYMENTDONE`, `isTipReceiptNavigationPending`, `isConnected`, `restaurantInfoFailed`, `loyaltyPoints` |
-| **LiveData events** | `tableChangeLiveData`, `setNewGuestLiveData`, `createNewGuestLiveData`, `isTableChanged`, `_menuItemLiveData`, `splitTicketRefreshLiveData`, `isMenuSheetVisibleEvent`, `discountPercentPaymentBool`, `employeeDiscountPercentPaymentBool`, `discountPricePaymentBool`, `callItemFragment` |
-| **Card / Adyen** | `cardDetailsPaymentIntent` |
+| `refundConfirmation == true` → show `refundReasonView` | Plain `navController.popBackStack()` (Confirmation was pushed on top of Reason) |
+| `refundReason == true` → show `refundAmountSelectionView`, call `setupCheckboxListeners()` + `refreshViewState()` | Plain `navController.popBackStack()`. `setupCheckboxListeners()`/`refreshViewState()` move into `RefundAmountSelectionFragment.onViewCreated()`/`onStart()`, which re-runs naturally every time Fragment's view is recreated after being popped back to -- no special-casing needed |
+| `paymentSelection == true` **and** currently showing `PaymentSelectionView` → exit flow | `navController.popBackStack()` returns `false` (Payment Selection is the effective start destination after the loading placeholder is popped) → fall through to `exitRefundFlowToPaymentParent()` |
+| `paymentSelection == true` **and NOT** currently on `PaymentSelectionView` (shouldn't happen given current flag semantics, but defensively handled) | Same `popBackStack()` call handles it uniformly -- no separate branch needed |
+| `else` (single-payment flow, Amount Selection is first screen) → exit flow | `navController.popBackStack()` returns `false` (Amount Selection is the effective start destination) → `exitRefundFlowToPaymentParent()` |
 
----
-
-## Interface Design
-
-Create the interface at:
-`mpos/src/main/java/aio/app/mpos/repositories/shared/SharedRepository.kt`
+Net result, `RefundMainFragment`'s back handling collapses from a 50-line if/else chain to:
 
 ```kotlin
-package aio.app.mpos.repositories.shared
-
-import aio.app.commons.datamodels.adyen.CardDetails
-import aio.app.commons.datamodels.posTicketItems.TicketData
-import aio.app.commons.datamodels.posTicketItems.servicecharges.ServiceChargeModel
-import aio.app.commons.utils.PaymentUtilObject
-import aio.app.mpos.datamodels.deviceresponse.GetPosDevicesResponse
-import aio.app.mpos.datamodels.ticket.CreateTicketResponse
-import aio.app.mpos.datamodels.ticket.TicketResponse
-import androidx.lifecycle.MutableLiveData
-
-interface SharedRepository {
-
-    // --- Auth / Session ---
-    var sessionId: String
-    var bearerToken: String
-    var tenantId: Int
-    var refreshToken: String
-    var userAccessToken: String
-    var userIdToken: String
-    var resetUserIdToken: String
-    var mPosId: Int
-    var userIdStr: String
-    var employeeName: String
-    var userId: String
-
-    // --- Payment ---
-    var discount: Double
-    var tax: Double
-    var subtotal: Double
-    var allDiscounts: Double
-    var total: Double
-    var tempSubtotal: Double
-    var paymentAmount: Double
-    var tenderName: String
-    var tenderId: Int
-    var tenderIsTipAllowed: Boolean
-    var balanceDue: Double
-    var remainingBalance: Double
-    var cashTendered: Double
-    var changeDue: Double
-    var serviceCharge: Double
-    var taxRate: Double
-    var paymentId: Int
-    var rating: Int
-    var receiptName: String
-    var emailAddress: String
-    var phoneNumber: String
-    var paymentStatus: String
-    var paymentSummaryStatus: String
-    var ticketId: String
-    var paymentIntentId: String?
-    var pspReferenceIdAdyen: String
-    var paymentMethod: String
-    var paymentProvider: String?
-    var tipAmount: Double
-    var customTipAmount: Double
-    var partialPaid: Boolean
-    var paymentUtilObject: PaymentUtilObject
-    var serviceChargeList: ArrayList<ServiceChargeModel>
-    var cardDetailsPaymentIntent: CardDetails
-
-    // --- Register / Table ---
-    var selectedTableId: Int
-    var tableNum: Int
-    var billType: String
-    var guestChipClicked: Int
-    var selectedTicketId: Int
-    var ticketsByTableResponse: TicketResponse
-    var currentlySelectedTicketPos: Int
-    var currentTicket: TicketData
-    var ticketStatus: String
-    var changedTableNumber: String
-    var createTicketResponse: CreateTicketResponse
-    var printersListResponse: GetPosDevicesResponse?
-    var terminalStatus: String
-    var connectLocationId: String?
-    var autoGratuityBool: Boolean
-    var largePartySize: Int
-
-    // --- Guest ---
-    var currentlySelectedGuest: ArrayList<String>
-    var currentSelectedName: String
-    var currentGuest: String
-
-    // --- Discount ---
-    var discountType: String
-    var ticketItemId: Int
-    var discountPercent: Double
-    var employeeDiscountPercent: Double
-    var discountPrice: Double
-
-    // --- UI flags ---
-    var ticketsRemaining: Boolean
-    var isCardFragVisible: Boolean
-    var processPaymentDone: Boolean
-    var isTipReceiptNavigationPending: Boolean
-    var isConnected: Boolean
-    var restaurantInfoFailed: Boolean
-    var loyaltyPoints: Int
-
-    // --- LiveData events ---
-    val tableChangeLiveData: MutableLiveData<Boolean>
-    val setNewGuestLiveData: MutableLiveData<Boolean>
-    val createNewGuestLiveData: MutableLiveData<Boolean>
-    val isTableChanged: MutableLiveData<Boolean>
-    val menuItemLiveData: MutableLiveData<Boolean>
-    val splitTicketRefreshLiveData: MutableLiveData<Boolean>
-    val isMenuSheetVisibleEvent: MutableLiveData<Boolean>
-    val discountPercentPaymentBool: MutableLiveData<Boolean>
-    val employeeDiscountPercentPaymentBool: MutableLiveData<Boolean>
-    val discountPricePaymentBool: MutableLiveData<Boolean>
-    val callItemFragment: MutableLiveData<Boolean>
-
-    // --- Utility ---
-    fun resetPaymentState()
-    fun resetSessionState()
+override fun handleOnBackPressed() {
+    val popped = navHostFragment.navController.popBackStack()
+    if (!popped) exitRefundFlowToPaymentParent()
 }
 ```
 
----
+**Exception -- `RefundConfirmationFragment`'s "processing" sub-state:** when the user taps Confirm, the current code doesn't navigate anywhere -- it hides `cancelBtn`/`confirmBtn` and shows `processingRefund` *within the same view* (`RefundMainFragment.kt:956-960`), and on failure reverses that (`cardRefund()` failure path, lines 1805-1816). This is **not** a navigation event and must **not** become one -- it stays exactly as internal view-state toggling inside `RefundConfirmationFragment`, driven by a result callback (LiveData/callback from `RefundMainFragment` after `cardRefund()`/`cashRefund()` resolves) rather than a nav destination change. Getting this wrong (e.g. treating "processing" as its own destination) would change back-button behavior while a refund is in flight -- explicitly called out here as a trap to avoid.
 
-## Implementation
-
-Create at:
-`mpos/src/main/java/aio/app/mpos/repositories/shared/SharedRepositoryImpl.kt`
-
-```kotlin
-package aio.app.mpos.repositories.shared
-
-import aio.app.commons.datamodels.adyen.CardDetails
-import aio.app.commons.datamodels.posTicketItems.TicketData
-import aio.app.commons.datamodels.posTicketItems.servicecharges.ServiceChargeModel
-import aio.app.commons.utils.PaymentUtilObject
-import aio.app.mpos.datamodels.deviceresponse.GetPosDevicesResponse
-import aio.app.mpos.datamodels.ticket.CreateTicketResponse
-import aio.app.mpos.datamodels.ticket.TicketResponse
-import androidx.lifecycle.MutableLiveData
-import javax.inject.Inject
-import javax.inject.Singleton
-
-@Singleton
-class SharedRepositoryImpl @Inject constructor() : SharedRepository {
-
-    // Auth
-    override var sessionId = ""
-    override var bearerToken = ""
-    override var tenantId = -1
-    override var refreshToken = ""
-    override var userAccessToken = ""
-    override var userIdToken = ""
-    override var resetUserIdToken = ""
-    override var mPosId = -1
-    override var userIdStr = ""
-    override var employeeName = ""
-    override var userId = ""
-
-    // Payment
-    override var discount = 0.0
-    override var tax = 0.0
-    override var subtotal = 0.0
-    override var allDiscounts = 0.0
-    override var total = 0.0
-    override var tempSubtotal = 0.0
-    override var paymentAmount = 0.0
-    override var tenderName = ""
-    override var tenderId = -1
-    override var tenderIsTipAllowed = false
-    override var balanceDue = 0.0
-    override var remainingBalance = 0.0
-    override var cashTendered = 0.0
-    override var changeDue = 0.0
-    override var serviceCharge = 0.0
-    override var taxRate = 0.0
-    override var paymentId = 0
-    override var rating = 0
-    override var receiptName = ""
-    override var emailAddress = ""
-    override var phoneNumber = ""
-    override var paymentStatus = ""
-    override var paymentSummaryStatus = ""
-    override var ticketId = ""
-    override var paymentIntentId: String? = null
-    override var pspReferenceIdAdyen = ""
-    override var paymentMethod = ""
-    override var paymentProvider: String? = null
-    override var tipAmount = 0.0
-    override var customTipAmount = 0.0
-    override var partialPaid = false
-    override var paymentUtilObject = PaymentUtilObject()
-    override var serviceChargeList = ArrayList<ServiceChargeModel>()
-    override var cardDetailsPaymentIntent = CardDetails()
-
-    // Register / Table
-    override var selectedTableId = -1
-    override var tableNum = -1
-    override var billType = "Shared"
-    override var guestChipClicked = 0
-    override var selectedTicketId = -1
-    override var ticketsByTableResponse = TicketResponse()
-    override var currentlySelectedTicketPos = 0
-    override var currentTicket = TicketData()
-    override var ticketStatus = ""
-    override var changedTableNumber = ""
-    override var createTicketResponse = CreateTicketResponse()
-    override var printersListResponse: GetPosDevicesResponse? = null
-    override var terminalStatus = ""
-    override var connectLocationId: String? = null
-    override var autoGratuityBool = false
-    override var largePartySize = -1
-
-    // Guest
-    override var currentlySelectedGuest = ArrayList<String>()
-    override var currentSelectedName = ""
-    override var currentGuest = ""
-
-    // Discount
-    override var discountType = ""
-    override var ticketItemId = -1
-    override var discountPercent = 0.0
-    override var employeeDiscountPercent = 0.0
-    override var discountPrice = 0.0
-
-    // UI flags
-    override var ticketsRemaining = false
-    override var isCardFragVisible = false
-    override var processPaymentDone = false
-    override var isTipReceiptNavigationPending = false
-    override var isConnected = false
-    override var restaurantInfoFailed = false
-    override var loyaltyPoints = 0
-
-    // LiveData
-    override val tableChangeLiveData = MutableLiveData<Boolean>()
-    override val setNewGuestLiveData = MutableLiveData<Boolean>()
-    override val createNewGuestLiveData = MutableLiveData<Boolean>()
-    override val isTableChanged = MutableLiveData<Boolean>()
-    override val menuItemLiveData = MutableLiveData<Boolean>()
-    override val splitTicketRefreshLiveData = MutableLiveData<Boolean>()
-    override val isMenuSheetVisibleEvent = MutableLiveData<Boolean>()
-    override val discountPercentPaymentBool = MutableLiveData<Boolean>()
-    override val employeeDiscountPercentPaymentBool = MutableLiveData<Boolean>()
-    override val discountPricePaymentBool = MutableLiveData<Boolean>()
-    override val callItemFragment = MutableLiveData<Boolean>()
-
-    override fun resetPaymentState() {
-        discount = 0.0; tax = 0.0; subtotal = 0.0; allDiscounts = 0.0; total = 0.0
-        tempSubtotal = 0.0; paymentAmount = 0.0; tenderName = ""; tenderId = -1
-        tenderIsTipAllowed = false; balanceDue = 0.0; remainingBalance = 0.0
-        cashTendered = 0.0; changeDue = 0.0; serviceCharge = 0.0; taxRate = 0.0
-        paymentId = 0; rating = 0; receiptName = ""; emailAddress = ""; phoneNumber = ""
-        paymentStatus = ""; paymentSummaryStatus = ""; ticketId = ""
-        paymentIntentId = null; pspReferenceIdAdyen = ""; paymentMethod = ""
-        paymentProvider = null; tipAmount = 0.0; customTipAmount = 0.0
-        partialPaid = false; paymentUtilObject = PaymentUtilObject()
-        serviceChargeList = ArrayList(); cardDetailsPaymentIntent = CardDetails()
-        processPaymentDone = false; isTipReceiptNavigationPending = false
-    }
-
-    override fun resetSessionState() {
-        sessionId = ""; bearerToken = ""; tenantId = -1; refreshToken = ""
-        userAccessToken = ""; userIdToken = ""; resetUserIdToken = ""; mPosId = -1
-        userIdStr = ""; employeeName = ""; userId = ""
-    }
-}
-```
+**`RefundCompleteFragment` is a dead end, not a back-stack destination.** Every action on it (`noReceiptBtn`, `printBtn`, `smsBtn`, `emailBtn`) calls `movingBack()`, which exits directly to `PaymentParentFragment` (`clearRefundMainFragment()` + `setBillFragment()` + `setTicketPanFragment()`) -- it never relies on `popBackStack()`. No change needed here beyond confirming `movingBack()` is called from the new Fragment instead of `RefundMainFragment` directly (via a shared callback/ViewModel event, since `movingBack()` itself stays owned by `RefundMainFragment` -- it needs `parentFragment as? PaymentParentFragment`, which only `RefundMainFragment` has access to).
 
 ---
 
-## DI Registration
+## What Stays Exactly Where It Is
 
-Add a binding in `RepositoryModule.kt`:
+To keep the blast radius to "navigation + view hosting only":
 
-```kotlin
-// In the existing RepositoryModule (SingletonComponent)
-@Binds
-@Singleton
-abstract fun bindSharedRepository(
-    sharedRepositoryImpl: SharedRepositoryImpl
-): SharedRepository
-```
-
-No changes needed to `CoreModule` or `NetworkModule`.
+- `cardRefund()`, `cashRefund()`, `getPaymentRefundId()`, `movingBack()`, `calculateProportionalValue()`, `calculateAllProportionalReductions()`, all New Relic logging, all `Analytics()` calls -- **stay in `RefundMainFragment`**, unchanged. Child fragments call into `RefundMainFragment` (or a shared ViewModel event) to trigger these exactly as they do today via direct method calls -- e.g. `RefundConfirmationFragment`'s confirm button still ultimately triggers `RefundMainFragment.cardRefund()`/`cashRefund()`, just reached via `(parentFragment as RefundMainFragment)` or a shared `RefundFlowViewModel` event instead of a raw click listener registered directly on `refundConfirmationView!!.binding.confirmBtn` from within `RefundMainFragment`.
+- The SSE `BroadcastReceiver` (`onResume`/`onPause`, lines 2248-2292) and `OnReceiptCallback` (`onItemClick`, line 2234) -- stay in `RefundMainFragment`, since both are tied to the fragment's own lifecycle and its relationship with `RegisterActivity`, not to any individual step.
+- `Utils().resetBearerToken(businessIdViewModel)` calls in `onStop()`/`exitRefundFlowToPaymentParent()` -- unchanged, stay in `RefundMainFragment`.
 
 ---
 
-## Usage — Before vs After
+## Migration Phases
 
-### Before
-```kotlin
-// In a ViewModel or Fragment — direct global mutation
-Constants.BEARER_TOKEN = token
-Constants.discount = 12.5
-Constants.tableChangeLiveData.postValue(true)
-```
+Given this is a live, money-handling flow with no existing automated UI test coverage, migrate **incrementally, one destination at a time**, verifying manually against the real app after each phase (per this repo's `verify` skill) before moving to the next. Suggested order, easiest/lowest-risk first:
 
-### After
-```kotlin
-@HiltViewModel
-class CheckoutViewModel @Inject constructor(
-    private val repo: Repository,
-    private val sharedRepo: SharedRepository   // <-- inject here
-) : ViewModel() {
+1. **Prep (no visible behavior change):** Introduce `RefundFlowViewModel`, move the loose fields into it, update `RefundMainFragment` to read/write through it. Verify the whole flow still works identically -- this alone touches nothing about views/navigation and is the safest place to catch mistakes early.
+2. **`CancelOrderFragment`** -- simplest, most isolated (own start-destination branch, no shared state).
+3. **`RefundCompleteFragment`** -- terminal screen, no back-stack interaction to get wrong.
+4. **`RefundConfirmationFragment`** -- moderate; must carefully preserve the "processing" internal sub-state (see callout above).
+5. **`RefundReasonFragment`** -- simple, but exercises the `viewModel.reasonDialog`/`viewModel.nextBtn` observer wiring.
+6. **`PaymentSelectionFragment`** and **`RefundAmountSelectionFragment`** -- last, since they hold the most state and the dynamic-start-destination logic (`RefundLoadingFragment`) depends on both existing first.
 
-    fun applyDiscount(amount: Double) {
-        sharedRepo.discount = amount
-        sharedRepo.discountPercentPaymentBool.postValue(true)
-    }
-
-    fun onTableChanged() {
-        sharedRepo.tableChangeLiveData.postValue(true)
-    }
-}
-```
-
-For Fragments that observe LiveData but don't need to write state, only inject `SharedRepository` via the ViewModel — the Fragment observes through the ViewModel, not directly.
+After each phase, keep the old `View` class in place but unused (don't delete) until the *whole* migration is verified end-to-end -- cheap insurance, delete them all together at the end once QA signs off.
 
 ---
 
-## Migration Strategy
+## Verification Checklist (manual, per phase and again end-to-end)
 
-Because `Constants` is referenced in many places, a full cut-over in one PR would be too risky. The recommended approach is:
-
-### Phase 1 — Add the repo, keep Constants working (no breakage)
-1. Create `SharedRepository` interface + `SharedRepositoryImpl`.
-2. Register in `RepositoryModule`.
-3. Do **not** delete anything from `Constants.kt` yet.
-4. In new code, write to `SharedRepository` only.
-
-### Phase 2 — Migrate one domain group at a time
-Migrate in this order (lowest blast radius first):
-1. Auth/Session fields — written in login flow only
-2. Discount fields — isolated to discount fragments
-3. Guest/Table fields — used by register screens
-4. Payment fields — broadest usage, do last
-
-For each group:
-- Find all reads/writes via `grep -r "Constants\.<fieldName>"`.
-- Replace writes with `sharedRepo.<field> = ...` in the owning ViewModel.
-- Replace reads with `sharedRepo.<field>` wherever the class already has `SharedRepository` injected.
-- Delete the field from `Constants.kt` once all call sites are gone.
-
-### Phase 3 — Remove Constants mutable state entirely
-After all `var` fields are migrated, `Constants.kt` becomes a pure `const val` object. At this point:
-- Rename it to something like `AppKeys.kt` or `AppConfig.kt` if desired.
-- Remove the `object` wrapper if you prefer top-level `const val` declarations.
+- Single payment, cash refund, full amount -- reaches `RefundCompleteFragment`, print/SMS/email/no-receipt all work.
+- Single payment, card refund, partial amount -- confirmation shows "(Partial refund)", proportional SC/tax/gratuity recalculation on amount edit still matches pre-migration values.
+- Multiple payments / split ticket -- `PaymentSelectionFragment` shown first, selecting a payment enables Next, navigates to Amount Selection with that payment's values.
+- Back button from every screen: Confirmation → Reason (reason radio state preserved), Reason → Amount Selection (checkbox/amount state preserved via `refreshViewState()`), Amount Selection (as first screen) → exits to `PaymentParentFragment`, Payment Selection (as first screen) → exits to `PaymentParentFragment`.
+- "Other" reason flow -- empty reason blocks Next with the enter-reason dialog; non-empty reason flows to Confirmation correctly.
+- Scheduled order + card refund -- cancellation-before-refund branch (`cardRefund()`'s `isScheduledOrder` path) still fires correctly from the new Confirmation fragment's confirm button.
+- Refund API failure -- returns to Confirmation with buttons restored, error message shown (not stuck in "processing").
+- Online-order cancellation branch (`ARG_SHOW_CANCEL_VIEW = true`) -- `CancelOrderFragment` shown directly, retry button re-triggers the cancel flow correctly, success transitions into the normal refund flow.
+- SMS/Email receipt screens still return control correctly via `OnReceiptCallback.onItemClick`.
 
 ---
 
-## Commons Module Constants
+## Rollback Plan
 
-`commons/src/main/java/aio/app/commons/utils/Constants.kt` contains:
-- All view-height `const val` — leave them, they are true constants.
-- `var DATEFORMAT` and `var taxListCustom` — these are mutable and could move to a commons-level `SharedRepository`, but since the commons module has no DI of its own it is simpler to keep them as-is or pass them via function parameters when needed.
-
----
-
-## Testing Benefit
-
-With `SharedRepository` as an interface, tests can provide a fake:
-
-```kotlin
-class FakeSharedRepository : SharedRepository {
-    override var bearerToken = "test-token"
-    override var discount = 0.0
-    // ... set only what the test needs
-}
-
-@Test
-fun `checkout applies discount correctly`() {
-    val fake = FakeSharedRepository()
-    val vm = CheckoutViewModel(fakeRepo, fake)
-    vm.applyDiscount(10.0)
-    assertEquals(10.0, fake.discount)
-}
-```
-
-This is impossible with the current static `Constants` object.
+Since old `View` classes remain in the codebase (undeleted) until the full migration is verified, rolling back any single phase is a revert of that phase's commit -- `RefundMainFragment` falls back to instantiating the old `View` for that step exactly as before. No data migration, no API changes, and no persisted state format changes are involved anywhere in this plan, so rollback carries no cleanup cost.
