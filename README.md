@@ -1,246 +1,137 @@
-# RefundMainFragment: Manual View-Switching to Nested NavGraph Migration
+#Tech Analysis — Special Request Entry Point & CTA Redesign (QSR + TSR)
 
-**Area:** `pos/src/main/java/aio/app/pos/ui/main/fragments/refund/`
-**Status:** Proposed (not started)
-**Scope:** Presentation/navigation layer only -- no business logic, calculations, API contracts, or analytics/logging calls change.
-
----
-
-## Context
-
-`RefundMainFragment` is hosted by `PaymentParentFragment` via a plain `childFragmentManager` transaction (`setRefundMainFragment()` / `clearRefundMainFragment()` in `PaymentParentFragment.kt:685-720`), replacing `payByCashFragmentContainer`. It is **not** currently part of any Navigation Component graph -- it's a manually managed child fragment, and this migration does not change that boundary.
+**Scope:**Change the Special Request entry point on the modifier screen from a plain tile to a "+" affordance, and make the modal's primary CTA / secondary action context-sensitive (new+modifier-satisfied, new+modifier-pending, editing-existing, removing-existing), across both QSR (`QsrMenuFragment`) and TSR (`TsrMenuFragment`).
 
-Inside `RefundMainFragment`, six "steps" are implemented as custom `View` subclasses (not Fragments), all inflated up front in `onCreateView()` and added to a single container (`binding.addView`, see `fragment_refund_main.xml:28-36`):
+**Status:**Pre-implementation technical analysis. No code has been changed for this CR yet.
 
-| Step (current class) | Extends | Binding | Lines |
-|---|---|---|---|
-| `PaymentSelectionView` | `RelativeLayout` | `PaymentSelectionViewBinding` | 88 |
-| `RefundAmountSelectionView` | (ViewGroup) | `RefundAmountSelectionBinding` | 871 |
-| `RefundReasonView` | `RelativeLayout` | `RefundReasonViewBinding` | 29 |
-| `RefundConfirmationView` | `RelativeLayout` | `RefundConfirmationViewBinding` | 21 |
-| `RefundCompleteView` | `RelativeLayout` | `RefundCompleteViewBinding` | 20 |
-| `CancelOrderView` | `RelativeLayout` | `CancelOrderViewBinding` | ~30 |
+---##1. Feature Overview
 
-`RefundMainFragment` (2362 lines) owns:
-- All six view instances and toggles `visibility = VISIBLE/GONE` to move between them (`hideAllViews()`, and the show-calls scattered through `clickListeners()`, `handleBackButtonClick()`, `cardRefund()`, `cashRefund()`).
-- All cross-step mutable state as plain fields: `reason`, `refundedAmount`, `refundedTax`, `refundedTip`, `refundedRiderTip`, `refundedServiceCharges`, `refundedGratuity`, `refundedDeliveryFee`, `refundDateTime`, `refundableAmount`.
-- Four booleans standing in for "current step": `paymentSelection`, `refundReason`, `refundConfirmation`, `refundAmountSelection`, plus two init-guard booleans (`isPaymentSelectionViewInitialized`, `isRefundAmountSelectionViewInitialized`).
-- All business logic: `cardRefund()`, `cashRefund()`, `getPaymentRefundId()`, `movingBack()`, proportional recalculation helpers, New Relic logging, Analytics calls, SSE broadcast receiver (`onResume`/`onPause`), `OnReceiptCallback` (for SMS/Email screens launched via `RegisterActivity`).
-- Direct reach-into-child-view-internals coupling, e.g. `refundReasonView!!.binding.rBtnFive.isChecked`, `refundAmountSelectionView?.binding?.rAmountET?.text` -- the parent fragment freely pokes at every child's binding.
-
-This is documented in the companion discussion; this document is the concrete migration plan.
+Special Request today is **not a first-class feature**— it is a synthetic pseudo-modifier injected into the same list as real modifier groups:
 
----
+-Object: `Modifier(modifierName = "Special Request", id = 999)`, alongside `"Item Comps"`(`id = 9999`) and the custom-modifier group (`id = -999`).
+-It renders through the **same tile component**as every other modifier group (`QsrModifierNewViewLayoutBinding`via `QsrModifierGroupAdapter`, and the TSR equivalent via `TsrModifierManagerImpl.setModifierGroupAdapter`). It carries no distinct visual treatment — this is what the PRD calls the "plain button."
+-Tapping the tile opens `Activity.showSpecialRequestPopUp(...)`, a plain `android.app.Dialog`(not a `DialogFragment`, not a bottom sheet) defined once in `DialogExtensions.kt`and reused by both flows via wrapper `RegisterActivity.showSpecialRequestPopup(...)`.
+-The dialog is a **fire-and-forget callback popup**: no ViewModel, no `LiveData`observed by the dialog itself, single `EditText`+ Done/Clear/Close, 50-char limit, and a `String -> Unit`callback that the calling Fragment uses to stash the text into a local `var specialRequest: String`field until "Done" is tapped on the modifier screen.
+- **Removal is not part of the dialog**— clearing an existing request happens by tapping the tile's *unselect*affordance, which silently sets `specialRequest = ""`, no confirmation, no modal.
+- `specialRequest`is a plain `String?`field that already exists end-to-end: `TicketItem.specialRequest`, `Item.specialRequest`, `CustomItem.specialRequest`, `TicketItemRequest.specialRequest`, and is round-tripped through printers/KDS/refunds/online-ordering DTOs. This CR is a **UI/interaction-layer redesign only**— it does not need a new data field or schema change.
+-There is **no Navigation Component anywhere in the app**. "Menu screen" and "Modifier screen" are two visibility-states of the *same*Fragment instance (`ViewStub`/`View.isVisible`toggling), not two destinations. This materially simplifies the CR: "return to Menu screen" vs. "return to Modifier screen" are just two different existing function calls (`visibleMenuCategoryView(true)`vs. `getModifierListView(...)`/`modifierLayout(...)`), not new navigation graph work.
 
-## Goals
+##2. Business Context
 
-1. Replace the six manually-toggled `View`s with six Fragments hosted in a nested `NavHostFragment`, using a real back stack instead of the boolean-flag chain.
-2. Preserve **every** existing behavior exactly: all calculations, API calls, analytics events, New Relic logs, receipt/print/SMS/email flows, the online-order-cancellation branch, and every back-button edge case.
-3. Do it incrementally, screen by screen, so each step is independently verifiable against the live (money-handling) flow.
-4. Leave `PaymentParentFragment`'s hosting of `RefundMainFragment` untouched -- this migration is entirely internal to `RefundMainFragment`.
+Operators currently have to remember, unassisted, whether a required modifier still needs selecting before an item can be sent to the ticket — Special Request gives no feedback either way, and there is no way to tell at a glance that an item already carries a note (no distinct "has request" state on the tile beyond the generic "selected" tint shared with every other modifier). The CR's stated goal is to remove that ambiguity by:
+1.Making the entry point visually distinct (a `+`affordance) so operators recognize it as an always-available annotation action rather than a modifier choice.
+2.Making the modal itself resolve the "what happens when I tap the primary button" question via copy that is contextual to modifier-completion and new/edit state, and by folding "does this finish the item" feedback directly into the modal rather than requiring the operator to infer it.
+4.Adding an explicit removal action (currently: silent unselect-tap, easy to trigger by accident, no confirmation).
 
-## Non-Goals
+This is a UX/interaction-clarity CR, not a data-model or backend CR — every data field it touches already exists and is already wired through the ticket lifecycle.
 
-- No change to `cardRefund()` / `cashRefund()` business logic, request payloads, or backend contracts.
-- No change to `RefundAmountSelectionView`'s calculation logic (proportional reductions, tax recalculation) -- only how it's hosted.
-- No change to how `RefundMainFragment` itself is created/destroyed by `PaymentParentFragment`.
-- Not a rewrite of `RefundAmountSelectionView`'s internals (871 lines) -- it moves into a Fragment wrapper as-is.
+##3. Existing Code Review (Mandatory Pre-Implementation Step)
 
----
+###3.1 Architecture & Layering Review
 
-## Target Architecture
+- **No dedicated component for this feature.**Special Request logic is smeared across `QsrMenuFragment.kt`/ `TsrMenuFragment.kt`(~3000+ line God Fragments already), their `*RepoImpl`/`*ManagerImpl`delegates, the shared `DialogExtensions.kt`, and adapter classes (`QsrModifierGroupAdapter`, `TsrModifierGroupAdapter`) — identified purely by **magic-string comparison**(`modifier.groupName == "Special Request"`) repeated in at least 6 files (`QsrMenuFragment.kt`, `TsrMenuFragment.kt`, `QsrModifierGroupAdapter.kt`, `QsrModifierMultiplierAdapter.kt`, `QsrModifierOptionAdapter.kt`, `TicketItemOperations.kt`, `ModifierRepoImpl.kt`). There is no enum, no `sealed class`, no `is SpecialRequest`type check anywhere.
+- **No ViewModel owns this feature's state.**The in-progress special-request text lives as a bare `var specialRequest: String`field on each Fragment (QSR and TSR each have their own copy), reset to `""`only at the tail of `onBtnDoneItemClicked()`. It does not survive process death, and is not exposed via `SavedStateHandle`.
+- **Precedent exists for a cleaner shape**: `CustomModifierDialog`(`ui/dialogs/CustomModifierDialog.kt`) is a real `DialogFragment`with its own lifecycle; `Activity.openAddNoteDialog(...)`(`DialogExtensions.kt`line ~452) is the same "free text + counter" shape already used for ticket-level notes. Neither is used for Special Request today, but both are internal precedent for what a redesigned modal should look like structurally.
+- **Verdict:**Introducing the new context-sensitive CTA behavior into the *existing*magic-string + bare-field architecture will add a third and fourth branch to logic that is already duplicated per-flow. This CR is a reasonable trigger to at minimum extract a single shared `SpecialRequestState`(new/editing/removing × modifier-satisfied) and a single shared modal component used by both QSR and TSR, rather than hand-rolling the 4-state CTA logic twice more. See Improvement Decision Matrix (§4) for a scoped recommendation — full de-duplication of QSR/TSR is out of scope for this CR, but the modal itself should not be duplicated a third time.
 
-```
-RefundMainFragment (unchanged role: host + orchestrator)
-├── refundHeaderView (unchanged, include layout)
-├── btnBackRefund (unchanged, single back button -- now delegates to child NavController)
-└── refundNavHostContainer (NEW -- replaces "addView" ConstraintLayout)
-        └── NavHostFragment (app:navGraph="@navigation/refund_nav_graph")
-                ├── PaymentSelectionFragment
-                ├── RefundAmountSelectionFragment
-                ├── RefundReasonFragment
-                ├── RefundConfirmationFragment
-                ├── RefundCompleteFragment
-                └── CancelOrderFragment
-```
+###3.2 Concurrency & Coroutine Audit
 
-`RefundMainFragment` **keeps** its current responsibilities: it still owns `cardRefund()`, `cashRefund()`, `movingBack()`, the SSE broadcast receiver, `OnReceiptCallback`, and all logging/analytics. It becomes the **flow orchestrator holding the child `NavController`**, reacting to shared state changes and driving navigation -- it just stops manually toggling `View.GONE/VISIBLE` and instead calls `navController.navigate(...)`.
+- **`onBtnDoneItemClicked()`is a plain (non-suspend) function**that internally launches `viewLifecycleOwner.lifecycleScope.launch(IO)`for the *editing*branch only (`QsrMenuFragment.kt:1468`); the *new item*branch (`addItemWithDebounce`, line 1548) runs its `MetaData`construction synchronously on the calling (main) thread before handing off to `ticketMenuViewModel.pushItemToDb(...)`(whose internal dispatching was not traced in this pass — flagged for verification before implementation, see Identified Issues §I-4).
+- **`specialRequest = ""`is reset synchronously immediately after the async IO branch is launched**(`QsrMenuFragment.kt:1543`), i.e., outside the coroutine. This is currently safe because the coroutine captures `selectedTicketItem?.specialRequest`(already assigned before `launch`) rather than the fragment's `specialRequest`field directly — but it is a fragile invariant: any future change that reads the raw `specialRequest`field from inside the launched block (easy mistake given how many other reads of that field exist in the same class) would silently race against this reset.
+- **Debounce protection on the "new item" path is dead code.** `addItemWithDebounce()`(`QsrMenuFragment.kt:1548-1554`):
+  ```kotlinif (itemId == lastAddedItemId && (currentTime - lastAddedTime) < 0) {      return  }  ```  `System.currentTimeMillis()`only increases, so `(currentTime - lastAddedTime) < 0`is **effectively always false**— this guard never actually prevents a re-add. A rapid double-tap on the item's "Done" button (which the new "Add & Finish" CTA is a rename/re-entry-point of) can currently push the same item to the ticket twice. This predates the CR but sits directly on the code path the CR is renaming/re-triggering, so it should not be carried forward silently. See Identified Issues §I-1.
+- **The editing branch has *no*debounce guard at all**— a double-tap on what will become "Update & Finish" can fire two concurrent `lifecycleScope.launch(IO)`blocks, each independently calling `mainViewModel.updateItem(...)`→ `qsrTicketViewModel.updateQuantityAndMetaDataWithDiscountInBulk(...)`. Whether this is idempotent (last-write-wins, harmless) or produces duplicate DB rows/events was **not verified in this pass**— needs a direct read of `updateQuantityAndMetaDataWithDiscountInBulk`before sign-off. See Identified Issues §I-2.
+- **TSR mirrors the same shape**(`TsrMenuFragment.kt` `onBtnDoneItemClicked`line 1511, `onBtnDoneItemClickedMultiSelect`line 3510) with no debounce guard visible in either branch — flagged for the same reason.
 
-Each new Fragment takes over exactly what its View counterpart did: inflate its own binding, wire its own click listeners for **purely local** UI concerns (radio button mutual exclusion, checkbox toggles, recycler view adapters), and read/write shared flow state through a new `RefundFlowViewModel` instead of through `RefundMainFragment` fields.
+###3.3 Data Layer Review
 
-### New class: `RefundFlowViewModel`
+- `TicketItem.specialRequest: String?`(`commons/.../posTicketItems/TicketItem.kt:31`) and `CustomItem.specialRequest`(`CustomItem.kt:25`) are the persisted fields; `TicketItemRequest.specialRequest`is the outbound API/DB-write shape populated in `MainViewModel.updateItem()`(`MainViewModel.kt:1105`).
+- **No new column, migration, or DAO change is implied by this CR**— the field, its Room persistence, and its API round-trip already exist and are exercised today by the plain-button flow. This CR only changes *when/how*the existing field gets written and *what the UI does after*writing it.
+-One nuance worth flagging: `Modifier`(the in-memory pseudo-modifier used to render the tile) and `TicketItem.specialRequest`(the persisted string) are **two separate representations of the same concept**with no shared type — the "has an existing request" state the CR needs (to pick "Update & Finish" vs. "Add & Finish" copy, and to show/hide "Remove Request") must be derived by the Fragment reading `selectedTicketItem?.specialRequest?.isNotBlank()`at modal-open time; there is no single source of truth object to query instead.
 
-A `ViewModel` scoped to `RefundMainFragment` (`by viewModels()` in `RefundMainFragment`, `by viewModels({ requireParentFragment() })` in each child Fragment -- **not** Activity-scoped, so it's created/cleared with the refund flow exactly like the current fields are).
+###3.4 UI & State Management Review
 
-Holds what are today loose fields on `RefundMainFragment`:
+- **"Mandatory modifier selected" and "special request entered" are two completely independent booleans today**, and nothing currently composes them. Mandatory-modifier state is computed by `checkForAllRequiredAndPushedModifiers()`→ `*RepoImpl.checkRequiredModifier(...)`→ `enableDoneBtn(Boolean)`→ `mainViewModel.forcedModifierLiveData`(drives the *existing*Done button's enabled state elsewhere in the modifier screen). Special Request is **explicitly excluded**from this required-modifier filter (`QsrModifierGroupAdapter.kt:162`: `if (modifier.modifierName != "Special Request") { ... run required-selection logic ... }`).
+  - **Implication for this CR:**there is no existing combined state object for "new-with-modifier-satisfied" vs. "new-with-modifier-pending." The new modal must independently read the *current*mandatory-modifier-satisfied signal (best candidate: the same check `checkForAllRequiredAndPushedModifiers()`already performs, or the boolean it feeds into `forcedModifierLiveData`) at the moment the "+" is tapped, cross it with "is there already a `specialRequest`on `selectedTicketItem`," and derive one of the four CTA states from that 2×2. This is new logic, not a rename of existing logic.
+- **The dialog holds no lifecycle-aware state.**It's a raw `Dialog`, shown via an `Activity`extension function, with the in-progress text handed back purely through a lambda. Rotation is a non-issue for POS tablets locked to one orientation, but process death during the dialog (e.g., a backgrounded/low-memory kill) loses the in-progress note today — not introduced by this CR, but worth deciding whether the redesign's `DialogFragment`-based rebuild (if that path is chosen — see §4) should also close this gap, since it's nearly free once you're already restructuring the dialog as a `DialogFragment`.
+- **Both flows currently have zero "return to Menu" affordance from the modifier screen**other than completing the item (`ivBack`/`btnBack`/"back to menu" search returned no hits in either Fragment) — the closest existing precedent for the CR's two-destination CTA ("Add & Finish" → Menu, "Apply on item" → Modifier) is `checkModifierViewPan`/`checkModifierView`(`QsrMenuFragment.kt:1310-1334`), which already forks on `modifierCheckResult.hasRequired || hasPushed`to decide "show modifier list" vs. "go straight to menu" — architecturally the same fork this CR needs, and should be the template rather than inventing a new one.
+-TSR additionally carries `BreadcrumbHierarchy`/`BreadcrumbLevel`state (`MenuViewModelForRoom`) that QSR does not use — the "return to Modifier screen" branch on TSR should be verified against breadcrumb state (does the breadcrumb bar need to reflect "still on Modifier level" correctly after the popup closes?) since QSR has no equivalent to cross-check against.
 
-```kotlin
-class RefundFlowViewModel : ViewModel() {
-    var reason: String? = null
-    var refundedAmount = 0.00
-    var refundedTax = 0.00
-    var refundedTip = 0.00
-    var refundedRiderTip = 0.00
-    var refundedServiceCharges = 0.00
-    var refundedGratuity = 0.00
-    var refundedDeliveryFee = 0.00
-    var refundDateTime = ""
-    var refundableAmount: Double = 0.0
-    var isPaymentSelectionViewInitialized = false
-    var isRefundAmountSelectionViewInitialized = false
-}
-```
+###3.5 Performance & Memory Review
 
-This is the mechanism that lets child Fragments read/write "flow state" without holding a reference back to `RefundMainFragment` (today's `refundReasonView!!.binding...` pattern is replaced by each Fragment reading its own `binding` and writing into `RefundFlowViewModel`). All existing Activity-scoped ViewModels (`MainViewModel`, `PaymentViewModel`, `TicketViewModel`, `BusinessIdViewModel`) are obtained by each child Fragment the same way `RefundMainFragment` obtains them today (`activityViewModels()` / `viewModels()`) -- no change there.
+-The modal itself is lightweight (single `EditText`, no RecyclerView, no image loading) — no performance concern there.
+- `onBtnDoneItemClicked()`calls `allModifierList.transformToDummyModifier()`and `preparerMetadata(...)`synchronously on the main thread before any IO handoff, for *every*Done tap, regardless of Special Request involvement — this is pre-existing cost the CR does not add to, but since "Add & Finish" / "Update & Finish" will likely become a more frequently-tapped, more prominent CTA (directly inside the Special Request modal rather than a separate Done tap after closing it), a scan of `transformToDummyModifier()`'s complexity relative to typical modifier-list sizes may be worth a quick sanity check if the redesigned modal ends up calling this same path an additional time (e.g., to compute "is mandatory modifier satisfied" fresh at modal-open) rather than reusing an already-cached result.
+-No RecyclerView diffing, image assets, or animation work is implicated by adding a "+" glyph to the existing tile — purely a drawable/layout change on `QsrModifierNewViewLayoutBinding`'s equivalent for the Special Request tile specifically (or its TSR counterpart), not the whole adapter.
 
----
+###3.6 Reliability & Stability
 
-## File-by-File Mapping
+- **No confirmation on removal today**— tapping unselect on the tile deletes the special request with no dialog, no undo. The CR's explicit "Remove Request" secondary button is presented as a discoverable button, but the PRD does not mention a confirmation step; worth an explicit product decision (see Impact Assessment §5.1) since silent-delete-by-accident is exactly the kind of thing a "+"-driven, more prominent entry point will surface more (more visible = more traffic = more accidental taps).
+-The Done-tap empty-text handling (`"Please enter special request"`snackbar, `DialogExtensions.kt:591`) currently blocks *any*Done tap on empty text, including as a way to intentionally clear a request from inside the popup — this is inherited behavior the CR's "Remove Request" button is presumably meant to formalize/replace, but the existing Done-blocks-on-empty behavior needs to be explicitly retired (not just left in place alongside the new Remove button) or it will read as two conflicting mechanisms for the same intent.
+-Both fragments guard `selectedTicketItem?.status == OrderStatusEnum.FULFILLED.status`before allowing the tile to open the popup or unselect it (fulfilled/sent items are locked) — this guard must be carried into whichever of the 4 new CTA states apply to a fulfilled item; the PRD's four scenarios don't mention a "locked/fulfilled" case, which should be resolved before implementation (does "+" even render, or render disabled, on a fulfilled item?).
+-The two "return destination" behaviors (Menu vs. Modifier) both currently rely on **implicit fallthrough of the same visibility-toggle functions used elsewhere**— there is no dedicated state machine, so an implementation that special-cases the new CTA's navigation instead of routing through `checkModifierView`/`getModifierListView`/`visibleMenuCategoryView`risks silently diverging from what "return to Modifier screen" already means elsewhere in the screen (e.g., losing whatever pushed-modifier/required-modifier highlighting state those functions currently set up, which scenario 2's PRD copy explicitly promises: "It will highlight when you return").
 
-| Old (View, self-managed visibility) | New (Fragment, nav destination) | Layout reuse |
-|---|---|---|
-| `PaymentSelectionView.kt` | `PaymentSelectionFragment.kt` | Reuse `PaymentSelectionViewBinding`'s layout XML as the fragment's layout |
-| `RefundAmountSelectionView.kt` | `RefundAmountSelectionFragment.kt` | Reuse `RefundAmountSelectionBinding`'s layout XML |
-| `RefundReasonView.kt` | `RefundReasonFragment.kt` | Reuse `RefundReasonViewBinding`'s layout XML |
-| `RefundConfirmationView.kt` | `RefundConfirmationFragment.kt` | Reuse `RefundConfirmationViewBinding`'s layout XML |
-| `RefundCompleteView.kt` | `RefundCompleteFragment.kt` | Reuse `RefundCompleteViewBinding`'s layout XML |
-| `CancelOrderView.kt` | `CancelOrderFragment.kt` | Reuse `CancelOrderViewBinding`'s layout XML |
+###3.7 Test Coverage Assessment
 
-Each new Fragment's `onCreateView` uses the *same* generated `ViewBinding` class the old View used (`XxxBinding.inflate(inflater, container, false)`) -- the XML layouts themselves do not need to change, only the Kotlin class wrapping them (`RelativeLayout` subclass → `Fragment`).
+- **Zero existing automated coverage.**No unit tests and no instrumentation tests reference Special Request, the modifier-validation logic (`checkRequiredModifier`, `isMinimumOptionsSelected`, etc.), or either Fragment's Done-click handling. The one search hit (`TicketSequenceOrNullTest.kt`) contains the string only inside an unrelated test fixture blob.
+-This CR is therefore landing on **a zero-safety-net surface**: both the pre-existing debounce bug (§3.2) and the new 4-state CTA logic will ship with no regression tests unless this CR adds them. Given the CR is explicitly UX/interaction-focused and touches a God-Fragment with no seams for unit testing today, a full backfill of Fragment-level tests is likely out of scope — but the *new*pure-logic piece this CR introduces (deriving one of 4 CTA states from `hasSatisfiedRequiredModifiers × hasExistingSpecialRequest × isEditingRequest`) is naturally extractable into a small, independently unit-testable function, and should be, precisely because it's new code with no existing untested precedent to match.
 
-`fragment_refund_main.xml` changes from:
+##4. Identified Issues Log
 
-```xml
-<androidx.constraintlayout.widget.ConstraintLayout
-    android:id="@+id/addView"
-    ... />
-```
+| ID | Issue | Where | Severity | In scope for this CR? ||----|-------|-------|----------|------------------------|| I-1 | `addItemWithDebounce`'s guard condition (`currentTime - lastAddedTime < 0`) can never be true — debounce is dead code; rapid double-tap can double-add an item | `QsrMenuFragment.kt:1551` | Medium (pre-existing, but directly re-entered by the new "Add & Finish" CTA) | Recommend fixing alongside this CR — see Decision Matrix || I-2 | Editing branch of `onBtnDoneItemClicked` has no debounce guard at all in either QSR or TSR; double-tap on "Update & Finish" launches two concurrent IO writes | `QsrMenuFragment.kt:1468`, `TsrMenuFragment.kt:1511` | Medium — impact (duplicate write vs. harmless overwrite) unverified | Needs verification before scoping decision || I-3 | Special Request identified only by magic string `"Special Request"` repeated across 7 files, with `id = 999`/`9999`/`-999` sentinel values for the three pseudo-modifiers — fragile to typos/renames, no compile-time safety | `QsrMenuFragment.kt`, `TsrMenuFragment.kt`, adapters, `TicketItemOperations.kt`, `ModifierRepoImpl.kt` | Low (stability), Medium (maintainability) | Optional — see Decision Matrix || I-4 | Threading of `ticketMenuViewModel.pushItemToDb(...)` (the "new item" persistence path) was not traced to a dispatcher in this pass | `QsrMenuFragment.kt:1541` area | Unknown until verified | Verify before implementation sign-off || I-5 | No confirmation dialog on removing an existing special request today (silent unselect); PRD's new "Remove Request" doesn't specify a confirmation either | `TsrMenuFragment.kt:2635`, QSR equivalent | Low–Medium (data loss UX) | Product decision needed || I-6 | Popup's existing "Done blocks on empty text" behavior conflicts conceptually with the new explicit "Remove Request" action — two ways to express "no request," inconsistent going forward | `DialogExtensions.kt:585-594` | Low | In scope — must be resolved as part of this CR's modal rewrite || I-7 | Fulfilled/sent-item lock (`status == FULFILLED`) is enforced ad hoc at each call site today; the 4 new CTA states don't yet account for a 5th "locked" case | `QsrMenuFragment.kt`, `TsrMenuFragment.kt` (several sites) | Medium (functional gap in PRD, not a bug) | Needs product clarification before implementation || I-8 | Zero test coverage across the entire modifier-validation and special-request code path | app-wide | Medium (process risk, not a runtime bug) | New logic in this CR should be unit-testable; full backfill out of scope |##5. Improvement Decision Matrix (Mandatory)
 
-to:
+| Improvement candidate | Effort | Risk if deferred | Risk if bundled now | Blocks the CR? | Recommendation ||---|---|---|---|---|---|| Fix dead debounce guard (I-1) | Low (one-line condition fix + a real threshold) | Medium — CR actively increases traffic through this exact path by making "Add & Finish" the headline CTA | Low — isolated, mechanical fix | No, but touches the same lines the CR is editing | **Bundle.** Fixing it costs one line and this CR is already editing this function. || Add debounce to editing branch (I-2) | Low–Medium (mirror the (fixed) new-item guard) | Medium, same reasoning as I-1 but for "Update & Finish" | Low | No | **Bundle**, once I-4's threading question (below) is answered, so the fix accounts for the real dispatcher behavior. || Verify `pushItemToDb` dispatcher (I-4) | Low (read-only investigation) | N/A — this is a verification task, not a change | N/A | **Yes for I-1/I-2's design**, no for the CR's UI work | **Do first**, before finalizing I-1/I-2's exact implementation. || Replace magic-string identification with a typed model (I-3) | Medium–High (7 files, both flows, adapters + fragments) | Low — cosmetic/maintainability only, no functional risk today | Medium — broad surface area, easy to introduce regressions in unrelated modifier code (Item Comps, custom modifiers) that share the same `if/else` chains | No | **Defer.** Track as a separate tech-debt ticket; do not bundle into a UX-focused CR. || Confirmation dialog on Remove Request (I-5) | Low (reuse existing confirm-dialog pattern elsewhere in the app) | Low–Medium — accidental data loss, but request text is a soft-value note, not money/payment data | Low | **Product decision, not engineering** | **Escalate to product/design for an explicit answer before implementation**, since the PRD is silent on it and the new entry point is by design more discoverable/tappable. || Retire "Done blocks on empty" in favor of explicit Remove (I-6) | Low (delete one branch, rely on the new secondary button) | Medium — leaving both creates confusing, inconsistent UX exactly in the flow this CR is redesigning | Low | **Yes** — the PRD's 4 states assume Remove is the only removal path | **Bundle** — required for the CR to be internally consistent. || Define behavior for fulfilled/locked items (I-7) | Low (extend existing status guard into the new state derivation) | Medium — undefined behavior on a real, already-guarded status value | Low | **Yes**, needs an answer before the CTA-state derivation function can be written completely | **Resolve with product before implementation** — likely "+" affordance is hidden/disabled on fulfilled items, matching today's tile-level guard, but confirm explicitly. || Extract CTA-state derivation into a small pure function + unit tests (I-8, scoped) | Low | Medium — this is new logic; shipping it untested on a zero-coverage surface compounds the existing gap | Low | No | **Bundle**, scoped narrowly to the new 4-state derivation only — not a general test-backfill effort. || Consolidate QSR/TSR special-request handling into one shared component | High (both Fragments are ~3000-line God Fragments with divergent surrounding logic — breadcrumb state in TSR, none in QSR) | Low — current duplication is stable, just verbose | High — large, cross-cutting refactor risk for a CR that is supposed to be UX-scoped | No | **Defer.** At minimum, do not implement the new modal twice from scratch — extract *only* the modal + its CTA-state logic into one shared class/function called from both Fragments, without attempting to unify the surrounding Fragment architecture. |###Governance Rules
 
-```xml
-<fragment
-    android:id="@+id/refundNavHostFragment"
-    android:name="androidx.navigation.fragment.NavHostFragment"
-    app:navGraph="@navigation/refund_nav_graph"
-    app:defaultNavHost="false"
-    ... />
-```
+1. **Any improvement bundled into this CR must be traceable to a line this CR is already touching, or to a defect the PRD's new behavior directly re-exercises**(e.g., I-1/I-2 qualify because "Add & Finish"/"Update & Finish" *are*the renamed Done-tap this CR is redesigning). Improvements that merely happen to be nearby (I-3, full God-Fragment refactor) are deferred regardless of how easy they'd be, to keep the CR's blast radius matched to its stated UX scope.
+2. **No improvement with Medium+ "risk if bundled" proceeds without a design/product sign-off checkpoint**, even if engineering effort is low (see I-5, I-7 — both are one-line-of-code-equivalent decisions but carry product-facing behavior implications the PRD doesn't specify).
+3. **Any verification task (I-4) blocking a bundled fix's design must complete before that fix is implemented**, not discovered mid-implementation — this analysis explicitly separates "verify" from "fix" for that reason.
+4. **The new CTA-state derivation logic must ship as a pure, independently unit-tested function**regardless of the surrounding Fragment's lack of test coverage — new code does not inherit an exemption from testing because its neighbors are untested.
+5.Improvements deferred here (I-3, full consolidation) should be logged as separate follow-up tickets referencing this document, not silently dropped.
 
-`app:defaultNavHost="false"` is deliberate: `RefundMainFragment`'s existing `OnBackPressedCallback` (registered in `onViewCreated`, `RefundMainFragment.kt:322-329`) stays the single source of truth for back-press handling (see "Back Navigation" below) rather than letting the child `NavHostFragment` intercept system back on its own.
+##6. Impact Assessment
 
----
+###6.1 UI Impact
 
-## Handling the Two Dynamic/Conditional Flows
+-New "+" affordance on the Special Request tile in both `qsr_modifier_layout.xml`-driven grid and the TSR equivalent — additive visual change to one tile type, not a layout restructure of the modifier grid.
+-Modal redesign: 4 copy/CTA states replacing the current single "Done" button; new "Remove Request" secondary action; new under-input helper-text region for the 4 messages specified in the PRD's user stories. If the modal is rebuilt as a `DialogFragment`(recommended, see §3.1/§3.4) rather than patched onto the existing raw `Dialog`, this is a net-new layout/binding, not a patch of `layout_special_request_popup.xml`.
+-Two distinct "return" destinations (Menu vs. Modifier) must visually resolve to the *existing* `visibleMenuCategoryView`/`getModifierListView`transitions — no new transition/animation work implied if reusing those functions per the architecture review's recommendation.
+-Fulfilled/locked-item visual state for the new "+" needs an explicit design answer (I-7).
 
-This is the part of the current code most likely to regress if migrated carelessly -- both flows pick their *first* screen based on data that isn't known until an `IO` dispatch resolves, which is why the current implementation waits until `onCreateView` runs a suspend function before deciding what to show.
+###6.2 API Contract Impact
 
-### 1. Cancel-order vs. normal refund (`RefundMainFragment.kt:239`)
+- **None.** `specialRequest: String?`is already part of every outbound request/response DTO this feature touches (`TicketItemRequest`, ticket-item update/create payloads). No backend or API-contract change is required — this CR is purely client-side interaction/UI.
 
-```kotlin
-if (cancelOnlineDeliveryOrder) inflateCancelOrderView()
-else lifecycleScope.launch { inflateRefundViews() }
-```
+###6.3 Database Impact
 
-This is a constructor-time argument (`ARG_SHOW_CANCEL_VIEW`), known synchronously. In the nav graph, this is **not** encoded as `app:startDestination` (a fixed XML attribute) -- instead, `RefundMainFragment` sets the graph's start destination in code, before the `NavHostFragment` is shown, mirroring how `newInstance(showCancelView)` already decides this today:
+- **None.**No new Room entity fields, no migration. The existing `specialRequest`column(s) on the local ticket-item tables already round-trip this data.
 
-```kotlin
-val navHostFragment = childFragmentManager.findFragmentById(R.id.refundNavHostFragment) as NavHostFragment
-val navController = navHostFragment.navController
-val graph = navController.navInflater.inflate(R.navigation.refund_nav_graph)
-graph.setStartDestination(
-    if (cancelOnlineDeliveryOrder) R.id.cancelOrderFragment else R.id.refundLoadingPlaceholder
-)
-navController.graph = graph
-```
+###6.4 Performance Impact
 
-### 2. Single-payment vs. multi-payment start screen (`inflateRefundViews()`, `RefundMainFragment.kt:595-646`)
+-Negligible expected impact. The only new computation is the 4-state CTA derivation (cheap boolean composition) evaluated at modal-open and possibly re-evaluated on modal-CTA-tap. No new list/adapter work, no new network calls beyond what already fires on Done-tap today.
+-Watch item: if the redesigned modal needs to re-run `checkForAllRequiredAndPushedModifiers()`-equivalent logic to freshly know "is mandatory modifier satisfied" at the moment the "+" is tapped (rather than reading an already-current cached boolean), confirm that re-check is cheap relative to typical modifier-list sizes — flagged in §3.5, not expected to be a real problem but worth a sanity pass during implementation.
 
-Today, after an `IO` fetch of ticket data, the code decides between showing `PaymentSelectionView` (multiple payments / split items) or jumping straight to `RefundAmountSelectionView` (single payment) -- this can't be known synchronously, so it can't be the graph's static start destination either.
+###6.5 Backward Compatibility
 
-**Solution:** add a lightweight, invisible `RefundLoadingFragment` as the graph's actual `app:startDestination` for the normal-refund branch. It does no rendering -- `onViewCreated` runs the same suspend check `inflateRefundViews()` does today, then calls:
+-Existing tickets with a populated `specialRequest`string are unaffected — the field's shape and meaning do not change, only the UI surface that reads/writes it.
+-No data migration needed for in-flight/offline-queued tickets created under the old plain-button flow; they will simply render with "has existing request" = true under the new modal the next time they're opened, which is the *intended*"editing" state (Scenario 3).
+-Any external system consuming `specialRequest`(printers, KDS, receipts, refunds, online ordering — per the data-layer review, ~100+ consuming files across modules) is unaffected since the underlying value and its transport format do not change.
 
-```kotlin
-navController.navigate(
-    if (multiplePaymentsOrSplit) R.id.action_loading_to_paymentSelection
-    else R.id.action_loading_to_amountSelection,
-    args,
-    navOptions { popUpTo(R.id.refundLoadingPlaceholder) { inclusive = true } }
-)
-```
+##7. Risk Assessment
 
-`popUpTo(...) { inclusive = true }` removes the placeholder from the back stack, so once the real first screen is showing, pressing back from it pops to *nothing* (matching today's behavior where back from the true first screen exits the whole flow, not "back to a loading screen").
+| Risk | Likelihood | Impact | Mitigation ||---|---|---|---|| Double-tap on "Add & Finish"/"Update & Finish" duplicates a ticket item or fires duplicate updates (I-1, I-2) | Medium — pre-existing gap, and this CR makes the CTA more prominent/central to the flow | Medium — duplicate line items on a live ticket are operator-visible and require manual correction | Bundle the debounce fix per Decision Matrix; verify dispatcher behavior first (I-4) || "Return to Modifier screen" branch doesn't restore the pushed/required-modifier highlight state the PRD promises ("It will highlight when you return") | Medium — no dedicated state machine exists for this today; easy to build a parallel, subtly different implementation instead of reusing `checkModifierView`/`getModifierListView` | Medium — breaks an explicit, user-facing promise in the PRD's own Scenario 2 copy | Implement the "return to Modifier" branch by calling the existing `getModifierListView`/`checkModifierView` functions rather than new bespoke navigation code || Accidental request removal via the more-discoverable "+" entry point, with no confirmation | Medium (increased discoverability → increased traffic) | Low — soft-value text note, not a financial/quantity change, but still user-visible data loss | Escalate I-5 to product for an explicit confirmation-dialog decision before implementation || Undefined behavior on fulfilled/locked items under the new 4-state model | Medium — PRD doesn't mention this case, but the underlying guard already exists and is actively enforced elsewhere | Medium — could either crash-adjacent (null derived state) or silently allow editing a sent item | Resolve I-7 with product before writing the state-derivation function || New logic ships untested on an already zero-coverage surface | High (coverage is already zero; nothing forces the new code to be different) | Low–Medium — process/quality risk more than an immediate functional one | Governance Rule 4 — new CTA-state derivation must be a unit-tested pure function || Scope creep into the God-Fragment architecture or magic-string cleanup (I-3, consolidation) | Medium — tempting given how invasive the surrounding code is | High if it happens — large blast radius on a CR that should stay UX-scoped | Governance Rules 1–2 explicitly gate this; both are logged as deferred follow-ups, not silently absorbed |###Rollback Strategy
 
-This keeps 100% of the existing decision logic (`selectedPayment.size > 1 || isItemSplited`) -- it just moves the "then what" from `paymentSelectionView?.visibility = View.VISIBLE` to `navController.navigate(...)`.
+-This is a client-only, no-schema, no-API-contract change, so rollback is a standard **app-version rollback/rollout-halt**— no data migration to reverse, no backend coordination needed.
+-Because the underlying `specialRequest`field and its persistence are unchanged, tickets created or edited under the new UI remain fully readable/editable under a rolled-back old build — there is no forward-only data shape introduced by this CR.
+-If bundled fixes (I-1/I-2 debounce) are shipped together with the UX change and need independent rollback, consider landing them as a **separate preceding commit/PR**so they can be cherry-picked or reverted independently of the UX redesign if only one side needs to roll back.
 
----
+###Monitoring Plan
 
-## Back Navigation Mapping
+-Extend the existing New Relic event logging already present throughout `onBtnDoneItemClicked`/`checkForAllRequiredAndPushedModifiers`(both Fragments already call `logNewRelicEvent(...)`extensively) to tag events with which of the 4 CTA states fired, so post-release funnel/adoption analysis is possible without new instrumentation infrastructure.
+-Add explicit logging around the debounce fix (I-1/I-2) — a log line when a duplicate tap is *suppressed*— so the fix's effectiveness is observable rather than assumed.
+-Watch for an increase in duplicate-item-on-ticket support/QA reports in the release immediately following this CR, as the most likely externally-visible symptom if I-1/I-2 are deferred or the fix is incomplete.
+-No new dashboards or alerting infra required — this rides on existing NewRelic event categories (`STMLogsTypeEnums`, `LogsCategoryEnums`) already used throughout this code path.
 
-`RefundMainFragment`'s current `handleBackButtonClick()` (lines 255-304) is a boolean-flag priority chain. Every branch maps directly onto `NavController` back-stack behavior, which is the strongest evidence this migration is low-risk for behavior parity:
+---##Open Questions for Product/Design (blocking full implementation sign-off)
 
-| Current boolean-flag branch | New behavior |
-|---|---|
-| `refundConfirmation == true` → show `refundReasonView` | Plain `navController.popBackStack()` (Confirmation was pushed on top of Reason) |
-| `refundReason == true` → show `refundAmountSelectionView`, call `setupCheckboxListeners()` + `refreshViewState()` | Plain `navController.popBackStack()`. `setupCheckboxListeners()`/`refreshViewState()` move into `RefundAmountSelectionFragment.onViewCreated()`/`onStart()`, which re-runs naturally every time Fragment's view is recreated after being popped back to -- no special-casing needed |
-| `paymentSelection == true` **and** currently showing `PaymentSelectionView` → exit flow | `navController.popBackStack()` returns `false` (Payment Selection is the effective start destination after the loading placeholder is popped) → fall through to `exitRefundFlowToPaymentParent()` |
-| `paymentSelection == true` **and NOT** currently on `PaymentSelectionView` (shouldn't happen given current flag semantics, but defensively handled) | Same `popBackStack()` call handles it uniformly -- no separate branch needed |
-| `else` (single-payment flow, Amount Selection is first screen) → exit flow | `navController.popBackStack()` returns `false` (Amount Selection is the effective start destination) → `exitRefundFlowToPaymentParent()` |
-
-Net result, `RefundMainFragment`'s back handling collapses from a 50-line if/else chain to:
-
-```kotlin
-override fun handleOnBackPressed() {
-    val popped = navHostFragment.navController.popBackStack()
-    if (!popped) exitRefundFlowToPaymentParent()
-}
-```
-
-**Exception -- `RefundConfirmationFragment`'s "processing" sub-state:** when the user taps Confirm, the current code doesn't navigate anywhere -- it hides `cancelBtn`/`confirmBtn` and shows `processingRefund` *within the same view* (`RefundMainFragment.kt:956-960`), and on failure reverses that (`cardRefund()` failure path, lines 1805-1816). This is **not** a navigation event and must **not** become one -- it stays exactly as internal view-state toggling inside `RefundConfirmationFragment`, driven by a result callback (LiveData/callback from `RefundMainFragment` after `cardRefund()`/`cashRefund()` resolves) rather than a nav destination change. Getting this wrong (e.g. treating "processing" as its own destination) would change back-button behavior while a refund is in flight -- explicitly called out here as a trap to avoid.
-
-**`RefundCompleteFragment` is a dead end, not a back-stack destination.** Every action on it (`noReceiptBtn`, `printBtn`, `smsBtn`, `emailBtn`) calls `movingBack()`, which exits directly to `PaymentParentFragment` (`clearRefundMainFragment()` + `setBillFragment()` + `setTicketPanFragment()`) -- it never relies on `popBackStack()`. No change needed here beyond confirming `movingBack()` is called from the new Fragment instead of `RefundMainFragment` directly (via a shared callback/ViewModel event, since `movingBack()` itself stays owned by `RefundMainFragment` -- it needs `parentFragment as? PaymentParentFragment`, which only `RefundMainFragment` has access to).
-
----
-
-## What Stays Exactly Where It Is
-
-To keep the blast radius to "navigation + view hosting only":
-
-- `cardRefund()`, `cashRefund()`, `getPaymentRefundId()`, `movingBack()`, `calculateProportionalValue()`, `calculateAllProportionalReductions()`, all New Relic logging, all `Analytics()` calls -- **stay in `RefundMainFragment`**, unchanged. Child fragments call into `RefundMainFragment` (or a shared ViewModel event) to trigger these exactly as they do today via direct method calls -- e.g. `RefundConfirmationFragment`'s confirm button still ultimately triggers `RefundMainFragment.cardRefund()`/`cashRefund()`, just reached via `(parentFragment as RefundMainFragment)` or a shared `RefundFlowViewModel` event instead of a raw click listener registered directly on `refundConfirmationView!!.binding.confirmBtn` from within `RefundMainFragment`.
-- The SSE `BroadcastReceiver` (`onResume`/`onPause`, lines 2248-2292) and `OnReceiptCallback` (`onItemClick`, line 2234) -- stay in `RefundMainFragment`, since both are tied to the fragment's own lifecycle and its relationship with `RegisterActivity`, not to any individual step.
-- `Utils().resetBearerToken(businessIdViewModel)` calls in `onStop()`/`exitRefundFlowToPaymentParent()` -- unchanged, stay in `RefundMainFragment`.
-
----
-
-## Migration Phases
-
-Given this is a live, money-handling flow with no existing automated UI test coverage, migrate **incrementally, one destination at a time**, verifying manually against the real app after each phase (per this repo's `verify` skill) before moving to the next. Suggested order, easiest/lowest-risk first:
-
-1. **Prep (no visible behavior change):** Introduce `RefundFlowViewModel`, move the loose fields into it, update `RefundMainFragment` to read/write through it. Verify the whole flow still works identically -- this alone touches nothing about views/navigation and is the safest place to catch mistakes early.
-2. **`CancelOrderFragment`** -- simplest, most isolated (own start-destination branch, no shared state).
-3. **`RefundCompleteFragment`** -- terminal screen, no back-stack interaction to get wrong.
-4. **`RefundConfirmationFragment`** -- moderate; must carefully preserve the "processing" internal sub-state (see callout above).
-5. **`RefundReasonFragment`** -- simple, but exercises the `viewModel.reasonDialog`/`viewModel.nextBtn` observer wiring.
-6. **`PaymentSelectionFragment`** and **`RefundAmountSelectionFragment`** -- last, since they hold the most state and the dynamic-start-destination logic (`RefundLoadingFragment`) depends on both existing first.
-
-After each phase, keep the old `View` class in place but unused (don't delete) until the *whole* migration is verified end-to-end -- cheap insurance, delete them all together at the end once QA signs off.
-
----
-
-## Verification Checklist (manual, per phase and again end-to-end)
-
-- Single payment, cash refund, full amount -- reaches `RefundCompleteFragment`, print/SMS/email/no-receipt all work.
-- Single payment, card refund, partial amount -- confirmation shows "(Partial refund)", proportional SC/tax/gratuity recalculation on amount edit still matches pre-migration values.
-- Multiple payments / split ticket -- `PaymentSelectionFragment` shown first, selecting a payment enables Next, navigates to Amount Selection with that payment's values.
-- Back button from every screen: Confirmation → Reason (reason radio state preserved), Reason → Amount Selection (checkbox/amount state preserved via `refreshViewState()`), Amount Selection (as first screen) → exits to `PaymentParentFragment`, Payment Selection (as first screen) → exits to `PaymentParentFragment`.
-- "Other" reason flow -- empty reason blocks Next with the enter-reason dialog; non-empty reason flows to Confirmation correctly.
-- Scheduled order + card refund -- cancellation-before-refund branch (`cardRefund()`'s `isScheduledOrder` path) still fires correctly from the new Confirmation fragment's confirm button.
-- Refund API failure -- returns to Confirmation with buttons restored, error message shown (not stuck in "processing").
-- Online-order cancellation branch (`ARG_SHOW_CANCEL_VIEW = true`) -- `CancelOrderFragment` shown directly, retry button re-triggers the cancel flow correctly, success transitions into the normal refund flow.
-- SMS/Email receipt screens still return control correctly via `OnReceiptCallback.onItemClick`.
-
----
-
-## Rollback Plan
-
-Since old `View` classes remain in the codebase (undeleted) until the full migration is verified, rolling back any single phase is a revert of that phase's commit -- `RefundMainFragment` falls back to instantiating the old `View` for that step exactly as before. No data migration, no API changes, and no persisted state format changes are involved anywhere in this plan, so rollback carries no cleanup cost.
+1.Does the "+" affordance render (and if so, in what state) on a fulfilled/sent item, given the existing `status == FULFILLED`lock elsewhere in this screen? (I-7)
+2.Should "Remove Request" show a confirmation step, given it's now reached via a more discoverable entry point than today's silent unselect-tap? (I-5)
+3.Confirm the "Apply on item" → return-to-Modifier-screen behavior should reuse the exact existing `getModifierListView`/`checkModifierView`fork rather than a new implementation, to preserve the "it will highlight when you return" promise made in the PRD's own copy.
