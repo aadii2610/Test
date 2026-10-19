@@ -1,246 +1,249 @@
-# RefundMainFragment: Manual View-Switching to Nested NavGraph Migration
+# Tech Analysis — Ticket, Menu & Payment UI/UX Clean Up
 
-**Area:** `pos/src/main/java/aio/app/pos/ui/main/fragments/refund/`
-**Status:** Proposed (not started)
-**Scope:** Presentation/navigation layer only -- no business logic, calculations, API contracts, or analytics/logging calls change.
-
----
-
-## Context
-
-`RefundMainFragment` is hosted by `PaymentParentFragment` via a plain `childFragmentManager` transaction (`setRefundMainFragment()` / `clearRefundMainFragment()` in `PaymentParentFragment.kt:685-720`), replacing `payByCashFragmentContainer`. It is **not** currently part of any Navigation Component graph -- it's a manually managed child fragment, and this migration does not change that boundary.
-
-Inside `RefundMainFragment`, six "steps" are implemented as custom `View` subclasses (not Fragments), all inflated up front in `onCreateView()` and added to a single container (`binding.addView`, see `fragment_refund_main.xml:28-36`):
-
-| Step (current class) | Extends | Binding | Lines |
-|---|---|---|---|
-| `PaymentSelectionView` | `RelativeLayout` | `PaymentSelectionViewBinding` | 88 |
-| `RefundAmountSelectionView` | (ViewGroup) | `RefundAmountSelectionBinding` | 871 |
-| `RefundReasonView` | `RelativeLayout` | `RefundReasonViewBinding` | 29 |
-| `RefundConfirmationView` | `RelativeLayout` | `RefundConfirmationViewBinding` | 21 |
-| `RefundCompleteView` | `RelativeLayout` | `RefundCompleteViewBinding` | 20 |
-| `CancelOrderView` | `RelativeLayout` | `CancelOrderViewBinding` | ~30 |
-
-`RefundMainFragment` (2362 lines) owns:
-- All six view instances and toggles `visibility = VISIBLE/GONE` to move between them (`hideAllViews()`, and the show-calls scattered through `clickListeners()`, `handleBackButtonClick()`, `cardRefund()`, `cashRefund()`).
-- All cross-step mutable state as plain fields: `reason`, `refundedAmount`, `refundedTax`, `refundedTip`, `refundedRiderTip`, `refundedServiceCharges`, `refundedGratuity`, `refundedDeliveryFee`, `refundDateTime`, `refundableAmount`.
-- Four booleans standing in for "current step": `paymentSelection`, `refundReason`, `refundConfirmation`, `refundAmountSelection`, plus two init-guard booleans (`isPaymentSelectionViewInitialized`, `isRefundAmountSelectionViewInitialized`).
-- All business logic: `cardRefund()`, `cashRefund()`, `getPaymentRefundId()`, `movingBack()`, proportional recalculation helpers, New Relic logging, Analytics calls, SSE broadcast receiver (`onResume`/`onPause`), `OnReceiptCallback` (for SMS/Email screens launched via `RegisterActivity`).
-- Direct reach-into-child-view-internals coupling, e.g. `refundReasonView!!.binding.rBtnFive.isChecked`, `refundAmountSelectionView?.binding?.rAmountET?.text` -- the parent fragment freely pokes at every child's binding.
-
-This is documented in the companion discussion; this document is the concrete migration plan.
+**PRD:** [PRD: Ticket, Menu & Payment UI/UX Clean Up](https://app.notion.com/p/aio-app/PRD-Ticket-Menu-Payment-UI-UX-Clean-Up-3bb5b13baaa381be9759de090c2ff949)
+**Figma:** [POS Menu – Ticket](https://www.figma.com/design/kvAxOA6nKvmsLCFKsUUkGp/POS-Menu---Ticket?node-id=16108-26229&t=TSFi3iXvvx3K6wFo-1)
+**Status:** Pre-implementation analysis. No code changed yet.
 
 ---
 
-## Goals
+## 1. Feature Overview
 
-1. Replace the six manually-toggled `View`s with six Fragments hosted in a nested `NavHostFragment`, using a real back stack instead of the boolean-flag chain.
-2. Preserve **every** existing behavior exactly: all calculations, API calls, analytics events, New Relic logs, receipt/print/SMS/email flows, the online-order-cancellation branch, and every back-button edge case.
-3. Do it incrementally, screen by screen, so each step is independently verifiable against the live (money-handling) flow.
-4. Leave `PaymentParentFragment`'s hosting of `RefundMainFragment` untouched -- this migration is entirely internal to `RefundMainFragment`.
+| Field | Value |
+| --- | --- |
+| **Jira Ticket** | *(pending)* |
+| **Feature Name** | Ticket, Menu & Payment UI/UX Clean Up |
+| **Module / Layer Affected** | **UI only** (`:pos` layouts, adapters, fragments). One small **Data/UI-state** addition for connected-device info in the hamburger panel. |
+| **Tech Lead / Owner** | *(pending)* |
+| **Estimated Complexity** | **L3**. No business logic changes, but it touches 6 surfaces, ~100+ layout files, and spacing that is partly set in Kotlin. |
+| **Initial Risk Level** | **Medium**. Wide visual blast radius, no UI/screenshot tests, and several God fragments. |
+| **Dependencies** | **Internal:** Figma sign-off, `HeaderFragment`, `left_nav_menu.xml`, `DeviceStatusViewModel`, `DialogExtensions.kt`. **External:** none. No API or backend change. |
+| **Target Release Date** | Release 8.0 |
 
-## Non-Goals
+### Business Context
 
-- No change to `cardRefund()` / `cashRefund()` business logic, request payloads, or backend contracts.
-- No change to `RefundAmountSelectionView`'s calculation logic (proportional reductions, tax recalculation) -- only how it's hosted.
-- No change to how `RefundMainFragment` itself is created/destroyed by `PaymentParentFragment`.
-- Not a rewrite of `RefundAmountSelectionView`'s internals (871 lines) -- it moves into a Fragment wrapper as-is.
+- **Problem:** Header, ticket pane, Menu screen, dropdowns, hamburger panel and pop-ups use different spacing and design patterns, so the POS feels fragmented.
+- **User impact:** POS staff (QSR/TSR) and managers get a consistent, easier-to-read UI. The hamburger panel also shows which devices are connected.
+- **Success criteria (from PRD):** 0 open UI-consistency QA defects, and 100% of impacted dropdowns and pop-ups follow the single design standard before 8.0 sign-off.
 
----
+### Scope by area
 
-## Target Architecture
-
-```
-RefundMainFragment (unchanged role: host + orchestrator)
-├── refundHeaderView (unchanged, include layout)
-├── btnBackRefund (unchanged, single back button -- now delegates to child NavController)
-└── refundNavHostContainer (NEW -- replaces "addView" ConstraintLayout)
-        └── NavHostFragment (app:navGraph="@navigation/refund_nav_graph")
-                ├── PaymentSelectionFragment
-                ├── RefundAmountSelectionFragment
-                ├── RefundReasonFragment
-                ├── RefundConfirmationFragment
-                ├── RefundCompleteFragment
-                └── CancelOrderFragment
-```
-
-`RefundMainFragment` **keeps** its current responsibilities: it still owns `cardRefund()`, `cashRefund()`, `movingBack()`, the SSE broadcast receiver, `OnReceiptCallback`, and all logging/analytics. It becomes the **flow orchestrator holding the child `NavController`**, reacting to shared state changes and driving navigation -- it just stops manually toggling `View.GONE/VISIBLE` and instead calls `navController.navigate(...)`.
-
-Each new Fragment takes over exactly what its View counterpart did: inflate its own binding, wire its own click listeners for **purely local** UI concerns (radio button mutual exclusion, checkbox toggles, recycler view adapters), and read/write shared flow state through a new `RefundFlowViewModel` instead of through `RefundMainFragment` fields.
-
-### New class: `RefundFlowViewModel`
-
-A `ViewModel` scoped to `RefundMainFragment` (`by viewModels()` in `RefundMainFragment`, `by viewModels({ requireParentFragment() })` in each child Fragment -- **not** Activity-scoped, so it's created/cleared with the refund flow exactly like the current fields are).
-
-Holds what are today loose fields on `RefundMainFragment`:
-
-```kotlin
-class RefundFlowViewModel : ViewModel() {
-    var reason: String? = null
-    var refundedAmount = 0.00
-    var refundedTax = 0.00
-    var refundedTip = 0.00
-    var refundedRiderTip = 0.00
-    var refundedServiceCharges = 0.00
-    var refundedGratuity = 0.00
-    var refundedDeliveryFee = 0.00
-    var refundDateTime = ""
-    var refundableAmount: Double = 0.0
-    var isPaymentSelectionViewInitialized = false
-    var isRefundAmountSelectionViewInitialized = false
-}
-```
-
-This is the mechanism that lets child Fragments read/write "flow state" without holding a reference back to `RefundMainFragment` (today's `refundReasonView!!.binding...` pattern is replaced by each Fragment reading its own `binding` and writing into `RefundFlowViewModel`). All existing Activity-scoped ViewModels (`MainViewModel`, `PaymentViewModel`, `TicketViewModel`, `BusinessIdViewModel`) are obtained by each child Fragment the same way `RefundMainFragment` obtains them today (`activityViewModels()` / `viewModels()`) -- no change there.
+| Area | Main code | Shared or duplicated |
+| --- | --- | --- |
+| Header | `HeaderFragment.kt` + `fragment_header.xml` | **Shared.** One fragment used by Register, Dashboard, Settings, Orders Hub, Gift Card and Cash Drawer. |
+| Ticket pane | `TicketFragment.kt` + `TicketMultiViewAdapter` + 5 `ticket_*_item_layout.xml` | **Shared** by QSR and TSR, but the 5 status row layouts are near-copies. |
+| Menu screen | `QsrMenuFragment` + `qsr*` adapters / `TsrMenuFragment` + `tsr*` adapters | **Duplicated.** QSR and TSR are separate stacks. |
+| Payment | `PaymentParentFragment`, `TicketPanFragment`, `BillFragment`, `PayBy*Fragment` | Own layouts and own ticket row (`row_items_bill.xml`). Shares nothing with Ticket/Menu. |
+| Dropdowns | 5 different mechanisms (see §2.4) | **Ad hoc.** No shared component. |
+| Hamburger panel | `left_nav_menu.xml` inside a `NavigationView` | Layout is **shared**. The drawer container and click wiring are **copied into 6 activities**. |
+| Pop-ups | 63 `DialogFragment`s + 54 raw `Dialog`s, 108 dialog layouts | **Ad hoc.** No base dialog class. |
 
 ---
 
-## File-by-File Mapping
+## 2. Existing Code Review
 
-| Old (View, self-managed visibility) | New (Fragment, nav destination) | Layout reuse |
-|---|---|---|
-| `PaymentSelectionView.kt` | `PaymentSelectionFragment.kt` | Reuse `PaymentSelectionViewBinding`'s layout XML as the fragment's layout |
-| `RefundAmountSelectionView.kt` | `RefundAmountSelectionFragment.kt` | Reuse `RefundAmountSelectionBinding`'s layout XML |
-| `RefundReasonView.kt` | `RefundReasonFragment.kt` | Reuse `RefundReasonViewBinding`'s layout XML |
-| `RefundConfirmationView.kt` | `RefundConfirmationFragment.kt` | Reuse `RefundConfirmationViewBinding`'s layout XML |
-| `RefundCompleteView.kt` | `RefundCompleteFragment.kt` | Reuse `RefundCompleteViewBinding`'s layout XML |
-| `CancelOrderView.kt` | `CancelOrderFragment.kt` | Reuse `CancelOrderViewBinding`'s layout XML |
+### 2.1 Architecture & Layering
 
-Each new Fragment's `onCreateView` uses the *same* generated `ViewBinding` class the old View used (`XxxBinding.inflate(inflater, container, false)`) -- the XML layouts themselves do not need to change, only the Kotlin class wrapping them (`RelativeLayout` subclass → `Fragment`).
+- **Header is in good shape.** It is one `HeaderFragment` added in code to `headerFrameLayout` in each activity (e.g. `RegisterActivity.kt:600`), so a single change covers every screen.
+- **The hamburger drawer is copied.** The `NavigationView` is declared in 6 activity layouts, and each activity wires drawer clicks itself (`RegisterActivity.setupDrawerClicks()` ~L1100, plus Dashboard, Settings, OrdersHub, GiftCard, CashDrawer). Changing the drawer's items or structure means touching all 6. Spacing-only changes in `left_nav_menu.xml` need just one edit.
+- **Menu layout is built in Kotlin, not XML.** RecyclerViews, LayoutManagers, span counts, heights and margins are created in code:
+  - QSR: `QsrHandlerImpl.kt:66, 93–102, 255–279`, `QsrMenuRepoImpl.kt:758–785`
+  - TSR: `TsrMenuManagerImpl.kt` (L106–559, heights `740`/`110` px), `TsrModifierManagerImpl.kt:120`
+  - Shared helpers: `ErrorStrings.kt:1334–1388`, which calls `setPadding(20, 5, 20, 5)`
 
-`fragment_refund_main.xml` changes from:
+  **XML-only spacing changes will not fix the Menu screen.**
+- **The ticket row is not composed from views.** Modifiers, special request and discount are drawn as one `TextView` using `SpannableStringBuilder`, `"\n"` and `LeadingMarginSpan` (`Utils.kt:151, 200, 667`). Spacing here is controlled in code.
+- **There is no design system.** The theme is `Theme.MaterialComponents.Light.NoActionBar` with 59 ad-hoc styles. Spacing is a mix of sdp/ssp (`_12sdp`), literal dp (~8,300 across 494 layouts) and a 20-entry `dimens.xml` with no spacing scale. There is no Compose.
 
-```xml
-<androidx.constraintlayout.widget.ConstraintLayout
-    android:id="@+id/addView"
-    ... />
-```
+### 2.2 Concurrency & Coroutines
 
-to:
+- No coroutine work is required for a visual change.
+- **Connected-device state is fragmented and partly broken** (relevant to the hamburger "connected device info" story):
+  - `DeviceStatusViewModel` exposes booleans only (`isInternetConnected`, `isKDSConnected`, `isPaymentTerminalConnected`) plus `printerErrors: StateFlow` (printer names). No source gives "device name + status" for every device.
+  - **Bug:** `DeviceHeatBeatHelper` sends terminal/printer status via `LocalBroadcastManager` (L190), but `BaseActivity.kt:251` registers with `Context.registerReceiver`. LocalBroadcastManager broadcasts never reach that receiver, so `isPaymentTerminalConnected` is likely never updated.
+  - `Constants.terminalStatus` is a global `@Volatile var` read by Bill, Ticket and PayByCard fragments. No writer was found in `:pos` apart from the reset in `Application.kt:294` (it may be set from a library; needs checking).
+  - `HeartBeatViewModel` holds a second, parallel `DeviceStatuses` LiveData. `SharedDataRepositoryImpl._terminalStatus` exists but nothing collects it.
+  - Printer and terminal health is **polled every 60s** (`SharedDataRepositoryImpl.kt:360–378`), so the status shown can be up to 60s old.
 
-```xml
-<fragment
-    android:id="@+id/refundNavHostFragment"
-    android:name="androidx.navigation.fragment.NavHostFragment"
-    app:navGraph="@navigation/refund_nav_graph"
-    app:defaultNavHost="false"
-    ... />
-```
+### 2.3 Data Layer
 
-`app:defaultNavHost="false"` is deliberate: `RefundMainFragment`'s existing `OnBackPressedCallback` (registered in `onViewCreated`, `RefundMainFragment.kt:322-329`) stays the single source of truth for back-press handling (see "Back Navigation" below) rather than letting the child `NavHostFragment` intercept system back on its own.
+- **No Room, API or DTO changes.**
+- The terminal reader name/serial is only fetched ad hoc in `TerminalStatusDialogFragment.kt` (~L97, 143, 233–271). Showing a terminal name in the hamburger panel needs a small repository-level source for it.
 
----
+### 2.4 UI & State Management
 
-## Handling the Two Dynamic/Conditional Flows
+- **Header height conflict:** the activity container is sized by a guideline (`constraintGuide_percent="0.075"`, `activity_register.xml:41`), but the `fragment_header.xml` root is hardcoded to `100dp`. The two can disagree depending on screen size.
+- **Screen sub-bars diverge:** QSR `clTop` (wrap_content, sdp margins) and TSR `clTop` (fixed 60dp, 12/16/20dp margins) are different layouts.
+- **Dropdowns — 5 mechanisms, no shared component:**
 
-This is the part of the current code most likely to regress if migrated carelessly -- both flows pick their *first* screen based on data that isn't known until an `IO` dispatch resolves, which is why the current implementation waits until `onCreateView` runs a suspend function before deciding what to show.
+  | Mechanism | Count | Key call sites |
+  | --- | --- | --- |
+  | `PopupWindow` | ~15 | `QsrMenuRepoImpl.kt:193` (Menu), `SearchFragment`, `CustomItemRepoImpl`, `OnlineOrdersPopUpHelper`, cash-drawer screens |
+  | `ListPopupWindow` | 4 | NoSale, PayOut, CashIn, CashOut |
+  | `PopupMenu` | 3 | `TicketFragment.kt:1355, 4050, 4349` (options, tax, check) |
+  | `Spinner` | 2 | Table builder screens |
+  | Exposed dropdown | 3 | Menu Manager item edit |
 
-### 1. Cancel-order vs. normal refund (`RefundMainFragment.kt:239`)
+  - The **header dropdown is built two ways** from the same `dropdown_layout.xml`. RegisterActivity shows it as a full-screen raw `Dialog` (`DialogExtensions.kt:1096`). The other 5 activities use an `<include>` toggled by visibility.
+  - There are 4 competing styles: `PopupMenuStyle` (M3), `Widget.App.PopupMenu` (MDC), `SpinnerStyle` (AppCompat), `ItemEditDropdownLayoutStyle`.
+- **Pop-ups — no standard:**
+  - 63 `DialogFragment`s, 54 raw `Dialog`s (18 in `DialogExtensions.kt`, 8 inline in `RegisterActivity`) and 3 `AlertDialog.Builder`s.
+  - Window width is set in code with 10+ different ratios (0.25 → 0.85). `setLayout(` appears in 72 files.
+  - 59 of 108 dialog layouts have **both** a close-X and a "Go back" button.
+  - Button order is mostly Cancel-left / Positive-right. `layout_multiple_device_popup.xml` stacks them vertically instead.
+  - The best existing base is `DiscardConfirmDialogFragment` + `dialog_discard_confirm.xml` (title / message / cancel | confirm) and `commons/.../DialogSizing.kt` `centerWithSize()`.
 
-```kotlin
-if (cancelOnlineDeliveryOrder) inflateCancelOrderView()
-else lifecycleScope.launch { inflateRefundViews() }
-```
+### 2.5 Performance & Memory
 
-This is a constructor-time argument (`ARG_SHOW_CANCEL_VIEW`), known synchronously. In the nav graph, this is **not** encoded as `app:startDestination` (a fixed XML attribute) -- instead, `RefundMainFragment` sets the graph's start destination in code, before the `NavHostFragment` is shown, mirroring how `newInstance(showCancelView)` already decides this today:
+- **Raw-px spacing set in code:** `setMargins(7, 7, 7, 7)` / `(7, 10, 7, 10)` in nearly every TSR and tiled adapter (`TsrItemsAdapter:84`, `TiledItemsAdapter:56`, `QsrItemAdapter:59`, …). These are pixels, not dp, so gaps change with screen density. They must be converted for spacing to be consistent.
+- **Ticket and modifier lists use `notifyDataSetChanged`** (`TicketMultiViewAdapter:76, 87`, all QSR/TSR modifier adapters). Not caused by this work, but full rebinds can cause flicker that QA may log as layout defects.
+- **Dialog leak / crash risk:**
+  - None of the 20 `Activity.*` dialog extensions in `DialogExtensions.kt` checks `isFinishing`/`isDestroyed`, and `BadTokenException` is never caught.
+  - Extension dialogs are local `val`s, so nothing can dismiss them in `onDestroy`.
+  - `RegisterActivity.onDestroy` dismisses only the break dialog. `voidOrderDialog`, `sendToKdsWarningDialog`, `receiptDialog` and `managerApprovalDialog` are not dismissed.
+  - 171 `DialogFragment.show()` calls have only 27 `isStateSaved` checks.
 
-```kotlin
-val navHostFragment = childFragmentManager.findFragmentById(R.id.refundNavHostFragment) as NavHostFragment
-val navController = navHostFragment.navController
-val graph = navController.navInflater.inflate(R.navigation.refund_nav_graph)
-graph.setStartDestination(
-    if (cancelOnlineDeliveryOrder) R.id.cancelOrderFragment else R.id.refundLoadingPlaceholder
-)
-navController.graph = graph
-```
+### 2.6 Reliability & Stability
 
-### 2. Single-payment vs. multi-payment start screen (`inflateRefundViews()`, `RefundMainFragment.kt:595-646`)
+- **Large files on the change path:** `RegisterActivity` 4938 lines, `TsrMenuFragment` 4782, `TicketFragment` 4669, `ErrorStrings.kt` 4672, `QsrMenuFragment` 3783, `BillFragment` 2613, `TicketPanFragment` 2512, `PayByCardFragment` 2146. The risk of an accidental logic change while editing layouts is real.
+- **Bug:** `left_nav_menu.xml:183` contains stray text `tvQuickServe` before the Settings `<TextView`.
+- Crash/ANR data (last 30–90 days) for the dialog paths above: *to be pulled from Crashlytics/New Relic before sign-off.*
 
-Today, after an `IO` fetch of ticket data, the code decides between showing `PaymentSelectionView` (multiple payments / split items) or jumping straight to `RefundAmountSelectionView` (single payment) -- this can't be known synchronously, so it can't be the graph's static start destination either.
+### 2.7 Test Coverage
 
-**Solution:** add a lightweight, invisible `RefundLoadingFragment` as the graph's actual `app:startDestination` for the normal-refund branch. It does no rendering -- `onViewCreated` runs the same suspend check `inflateRefundViews()` does today, then calls:
-
-```kotlin
-navController.navigate(
-    if (multiplePaymentsOrSplit) R.id.action_loading_to_paymentSelection
-    else R.id.action_loading_to_amountSelection,
-    args,
-    navOptions { popUpTo(R.id.refundLoadingPlaceholder) { inclusive = true } }
-)
-```
-
-`popUpTo(...) { inclusive = true }` removes the placeholder from the back stack, so once the real first screen is showing, pressing back from it pops to *nothing* (matching today's behavior where back from the true first screen exits the whole flow, not "back to a loading screen").
-
-This keeps 100% of the existing decision logic (`selectedPayment.size > 1 || isItemSplited`) -- it just moves the "then what" from `paymentSelectionView?.visibility = View.VISIBLE` to `navController.navigate(...)`.
+- **No UI or screenshot tests.** The only instrumentation test is `ExampleInstrumentedTest`. There are 5 unit test files in total, none covering UI.
+- Robolectric, Paparazzi and Roborazzi are not set up. Visual regressions will only be caught by manual QA.
 
 ---
 
-## Back Navigation Mapping
+## 3. Identified Issues Log
 
-`RefundMainFragment`'s current `handleBackButtonClick()` (lines 255-304) is a boolean-flag priority chain. Every branch maps directly onto `NavController` back-stack behavior, which is the strongest evidence this migration is low-risk for behavior parity:
-
-| Current boolean-flag branch | New behavior |
-|---|---|
-| `refundConfirmation == true` → show `refundReasonView` | Plain `navController.popBackStack()` (Confirmation was pushed on top of Reason) |
-| `refundReason == true` → show `refundAmountSelectionView`, call `setupCheckboxListeners()` + `refreshViewState()` | Plain `navController.popBackStack()`. `setupCheckboxListeners()`/`refreshViewState()` move into `RefundAmountSelectionFragment.onViewCreated()`/`onStart()`, which re-runs naturally every time Fragment's view is recreated after being popped back to -- no special-casing needed |
-| `paymentSelection == true` **and** currently showing `PaymentSelectionView` → exit flow | `navController.popBackStack()` returns `false` (Payment Selection is the effective start destination after the loading placeholder is popped) → fall through to `exitRefundFlowToPaymentParent()` |
-| `paymentSelection == true` **and NOT** currently on `PaymentSelectionView` (shouldn't happen given current flag semantics, but defensively handled) | Same `popBackStack()` call handles it uniformly -- no separate branch needed |
-| `else` (single-payment flow, Amount Selection is first screen) → exit flow | `navController.popBackStack()` returns `false` (Amount Selection is the effective start destination) → `exitRefundFlowToPaymentParent()` |
-
-Net result, `RefundMainFragment`'s back handling collapses from a 50-line if/else chain to:
-
-```kotlin
-override fun handleOnBackPressed() {
-    val popped = navHostFragment.navController.popBackStack()
-    if (!popped) exitRefundFlowToPaymentParent()
-}
-```
-
-**Exception -- `RefundConfirmationFragment`'s "processing" sub-state:** when the user taps Confirm, the current code doesn't navigate anywhere -- it hides `cancelBtn`/`confirmBtn` and shows `processingRefund` *within the same view* (`RefundMainFragment.kt:956-960`), and on failure reverses that (`cardRefund()` failure path, lines 1805-1816). This is **not** a navigation event and must **not** become one -- it stays exactly as internal view-state toggling inside `RefundConfirmationFragment`, driven by a result callback (LiveData/callback from `RefundMainFragment` after `cardRefund()`/`cashRefund()` resolves) rather than a nav destination change. Getting this wrong (e.g. treating "processing" as its own destination) would change back-button behavior while a refund is in flight -- explicitly called out here as a trap to avoid.
-
-**`RefundCompleteFragment` is a dead end, not a back-stack destination.** Every action on it (`noReceiptBtn`, `printBtn`, `smsBtn`, `emailBtn`) calls `movingBack()`, which exits directly to `PaymentParentFragment` (`clearRefundMainFragment()` + `setBillFragment()` + `setTicketPanFragment()`) -- it never relies on `popBackStack()`. No change needed here beyond confirming `movingBack()` is called from the new Fragment instead of `RefundMainFragment` directly (via a shared callback/ViewModel event, since `movingBack()` itself stays owned by `RefundMainFragment` -- it needs `parentFragment as? PaymentParentFragment`, which only `RefundMainFragment` has access to).
+| # | Category | Issue | Severity | Risk Impact |
+| --- | --- | --- | --- | --- |
+| I-1 | UI / Performance | Menu and adapter spacing set in Kotlin in **raw px** (`setMargins(7,…)`, `setPadding(20,5,20,5)`, heights `740`/`110`) | High | Spacing cannot be made consistent through XML alone and looks different on each density |
+| I-2 | Architecture | No spacing tokens or text styles. sdp, literal dp and a 20-entry `dimens.xml` are mixed | High | Without a single source of truth the clean-up will drift again |
+| I-3 | Architecture | No standard dialog component. 54 raw `Dialog`s, 63 `DialogFragment`s, 10+ width ratios | High | Directly blocks the "pop-up consistency" story |
+| I-4 | Architecture | No standard dropdown. 5 mechanisms and 4 styles; header dropdown built two ways | High | Directly blocks the "dropdown consistency" story |
+| I-5 | Memory / Crash | Raw dialogs shown without `isFinishing` guards and not dismissed in `onDestroy` (`DialogExtensions.kt`, `RegisterActivity`, `PayByCardFragment.reinitializingDialog`, `AddTipUnclosedFragment.tipDialog`) | High | Window leaks and `BadTokenException` crashes |
+| I-6 | Reliability | Terminal status receiver registered with `registerReceiver` but sent via `LocalBroadcastManager` (`BaseActivity.kt:251` vs `DeviceHeatBeatHelper.kt:190`) | High | The hamburger panel would show a wrong/stale terminal status |
+| I-7 | Architecture | Device status split across `DeviceStatusViewModel`, `HeartBeatViewModel`, `Constants.terminalStatus` and unused `_terminalStatus`. No name + status model | Medium | Connected-device info needs a new unified source |
+| I-8 | UI | Header height: guideline 7.5% vs hardcoded `100dp` root | Medium | Header clipping or gaps on some screen sizes |
+| I-9 | Architecture | Ticket status row layouts are 5 near-copies, plus a separate payment row | Medium | Every spacing change must be repeated in ~6 files; easy to miss one |
+| I-10 | Architecture | Drawer container and click wiring copied into 6 activities | Medium | Structural drawer changes need 6 edits |
+| I-11 | UI | Modifier, special-request and discount spacing is Spannable text (`Utils.kt:151–202, 667`) | Medium | Spacing changes touch shared rendering used by several bindings |
+| I-12 | Bug | Stray `tvQuickServe` text in `left_nav_menu.xml:183` | Low | Possible visible artefact / lint error |
+| I-13 | Performance | `notifyDataSetChanged` on ticket and modifier lists | Low | Flicker; QA noise |
+| I-14 | Test | No UI/screenshot tests for any affected screen | Medium | Visual regressions only caught manually |
 
 ---
 
-## What Stays Exactly Where It Is
+## 4. Improvement Decision Matrix
 
-To keep the blast radius to "navigation + view hosting only":
-
-- `cardRefund()`, `cashRefund()`, `getPaymentRefundId()`, `movingBack()`, `calculateProportionalValue()`, `calculateAllProportionalReductions()`, all New Relic logging, all `Analytics()` calls -- **stay in `RefundMainFragment`**, unchanged. Child fragments call into `RefundMainFragment` (or a shared ViewModel event) to trigger these exactly as they do today via direct method calls -- e.g. `RefundConfirmationFragment`'s confirm button still ultimately triggers `RefundMainFragment.cardRefund()`/`cashRefund()`, just reached via `(parentFragment as RefundMainFragment)` or a shared `RefundFlowViewModel` event instead of a raw click listener registered directly on `refundConfirmationView!!.binding.confirmBtn` from within `RefundMainFragment`.
-- The SSE `BroadcastReceiver` (`onResume`/`onPause`, lines 2248-2292) and `OnReceiptCallback` (`onItemClick`, line 2234) -- stay in `RefundMainFragment`, since both are tied to the fragment's own lifecycle and its relationship with `RegisterActivity`, not to any individual step.
-- `Utils().resetBearerToken(businessIdViewModel)` calls in `onStop()`/`exitRefundFlowToPaymentParent()` -- unchanged, stay in `RefundMainFragment`.
-
----
-
-## Migration Phases
-
-Given this is a live, money-handling flow with no existing automated UI test coverage, migrate **incrementally, one destination at a time**, verifying manually against the real app after each phase (per this repo's `verify` skill) before moving to the next. Suggested order, easiest/lowest-risk first:
-
-1. **Prep (no visible behavior change):** Introduce `RefundFlowViewModel`, move the loose fields into it, update `RefundMainFragment` to read/write through it. Verify the whole flow still works identically -- this alone touches nothing about views/navigation and is the safest place to catch mistakes early.
-2. **`CancelOrderFragment`** -- simplest, most isolated (own start-destination branch, no shared state).
-3. **`RefundCompleteFragment`** -- terminal screen, no back-stack interaction to get wrong.
-4. **`RefundConfirmationFragment`** -- moderate; must carefully preserve the "processing" internal sub-state (see callout above).
-5. **`RefundReasonFragment`** -- simple, but exercises the `viewModel.reasonDialog`/`viewModel.nextBtn` observer wiring.
-6. **`PaymentSelectionFragment`** and **`RefundAmountSelectionFragment`** -- last, since they hold the most state and the dynamic-start-destination logic (`RefundLoadingFragment`) depends on both existing first.
-
-After each phase, keep the old `View` class in place but unused (don't delete) until the *whole* migration is verified end-to-end -- cheap insurance, delete them all together at the end once QA signs off.
+| Issue | Fix now? | Justification | Backlog Ticket | Target Sprint |
+| --- | --- | --- | --- | --- |
+| I-1 Raw-px spacing in code | **Y** | Required to meet the PRD. Convert to `@dimen` tokens via `resources.getDimensionPixelSize` | — | *[Sprint]* |
+| I-2 Spacing tokens + text styles | **Y** | Foundation for every story. Add `dimens_spacing.xml` (4/8/12/16/24) and `TextAppearance.Pos.*` | — | *[Sprint]* |
+| I-3 Standard dialog | **Y** | Required by PRD. Build one `PosDialogFragment` + `layout_pos_dialog.xml` (title → body → Cancel \| Primary) | — | *[Sprint]* |
+| I-4 Standard dropdown | **Y** | Required by PRD. One `PosDropdown` helper (PopupWindow + shared style); migrate `PopupMenu`/`ListPopupWindow` sites in scope | — | *[Sprint]* |
+| I-5 Dialog leaks / crashes | **Y** | Governance: memory leak or crash → must fix. Covered for free by migrating in-scope dialogs to `PosDialogFragment`; add guards to the remaining raw dialogs we touch | — | *[Sprint]* |
+| I-6 Broadcast receiver mismatch | **Y** | One-line fix. Needed for correct device status in the hamburger panel | — | *[Sprint]* |
+| I-7 Unified device status model | **Y (scoped)** | Add a `ConnectedDevice(name, type, status)` list to `DeviceStatusViewModel` only. Do not remove `HeartBeatViewModel` or `Constants.terminalStatus` now | *[Ref]* (cleanup) | *[Sprint]* |
+| I-8 Header height conflict | **Y** | Header is in scope; single file | — | *[Sprint]* |
+| I-9 Merge ticket row layouts | **N** | Too risky for a visual-only PRD. Apply spacing tokens to each copy instead | *[Ref]* | *[Sprint]* |
+| I-10 Centralise drawer wiring | **N** | Only needed if drawer items change. PRD changes spacing and adds device info, both inside the shared include and `BaseActivity` | *[Ref]* | *[Sprint]* |
+| I-11 Spannable modifier text | **Y (values only)** | Replace the hardcoded `7f` dp indent and separator sizes with tokens. Do not restructure | — | *[Sprint]* |
+| I-12 Stray text in drawer XML | **Y** | Trivial, same file | — | *[Sprint]* |
+| I-13 `notifyDataSetChanged` | **N** | Not visual-scope. Log for performance backlog | *[Ref]* | *[Sprint]* |
+| I-14 Screenshot tests | **Y (scoped)** | Add Paparazzi/Roborazzi snapshots for the new shared components (dialog, dropdown, header, drawer) only. Screens stay manual QA | *[Ref]* (full coverage) | *[Sprint]* |
 
 ---
 
-## Verification Checklist (manual, per phase and again end-to-end)
+## 5. Impact Assessment
 
-- Single payment, cash refund, full amount -- reaches `RefundCompleteFragment`, print/SMS/email/no-receipt all work.
-- Single payment, card refund, partial amount -- confirmation shows "(Partial refund)", proportional SC/tax/gratuity recalculation on amount edit still matches pre-migration values.
-- Multiple payments / split ticket -- `PaymentSelectionFragment` shown first, selecting a payment enables Next, navigates to Amount Selection with that payment's values.
-- Back button from every screen: Confirmation → Reason (reason radio state preserved), Reason → Amount Selection (checkbox/amount state preserved via `refreshViewState()`), Amount Selection (as first screen) → exits to `PaymentParentFragment`, Payment Selection (as first screen) → exits to `PaymentParentFragment`.
-- "Other" reason flow -- empty reason blocks Next with the enter-reason dialog; non-empty reason flows to Confirmation correctly.
-- Scheduled order + card refund -- cancellation-before-refund branch (`cardRefund()`'s `isScheduledOrder` path) still fires correctly from the new Confirmation fragment's confirm button.
-- Refund API failure -- returns to Confirmation with buttons restored, error message shown (not stuck in "processing").
-- Online-order cancellation branch (`ARG_SHOW_CANCEL_VIEW = true`) -- `CancelOrderFragment` shown directly, retry button re-triggers the cancel flow correctly, success transitions into the normal refund flow.
-- SMS/Email receipt screens still return control correctly via `OnReceiptCallback.onItemClick`.
+### 5.1 UI Impact
+
+- **Layout changes:** yes, across header, drawer, ticket rows, QSR/TSR menu grids, payment panes and in-scope dialogs/dropdowns.
+- **Header and hamburger changes also apply to Dashboard, Settings, Orders Hub, Gift Card and Cash Drawer**, because they share `HeaderFragment` and `left_nav_menu.xml`. QA must cover those screens too.
+- **Navigation:** no change.
+- **State handling:** only the new connected-device list in `DeviceStatusViewModel`.
+
+### 5.2 API Contract Impact
+
+- None.
+
+### 5.3 Database Impact
+
+- None. No schema change, migration or backfill. Rollback is safe.
+
+### 5.4 Performance Impact
+
+- CPU and memory: neutral. Converting px to dimens is a lookup, and `PosDialogFragment` replaces existing dialogs one-for-one.
+- Network: none. Device status reuses existing heartbeats.
+- Startup: none.
+- Watch the drawer: observing device status must not re-inflate the drawer on every 60s heartbeat. Update only the status rows.
+
+### 5.5 Backward Compatibility
+
+- **Feature flag:** not practical for layout and spacing changes. Optional flag for the new device-info section only.
+- **Rollout:** ship per area as separate PRs inside 8.0 (see §6) so any one area can be reverted on its own.
+- Legacy: no data or behaviour change, so nothing to support.
 
 ---
 
-## Rollback Plan
+## 6. Proposed Implementation Plan
 
-Since old `View` classes remain in the codebase (undeleted) until the full migration is verified, rolling back any single phase is a revert of that phase's commit -- `RefundMainFragment` falls back to instantiating the old `View` for that step exactly as before. No data migration, no API changes, and no persisted state format changes are involved anywhere in this plan, so rollback carries no cleanup cost.
+| Phase | Work | Notes |
+| --- | --- | --- |
+| 0 | Foundation: spacing tokens, text styles, `PosDialogFragment`, `PosDropdown`, screenshot-test setup | No visible change on its own |
+| 1 | Header (I-8) + hamburger spacing + connected-device info (I-6, I-7, I-12) | Covers 6 activities |
+| 2 | Ticket pane: 5 status row layouts + Spannable spacing values (I-11) | Shared by QSR and TSR |
+| 3 | Menu screen: QSR, then TSR (I-1) | Largest effort; most spacing is in Kotlin |
+| 4 | Payment screens + migrate in-scope pop-ups and dropdowns (I-3, I-4, I-5) | Order: Ticket → Menu → Payment dialogs |
+
+---
+
+## 7. Risk Assessment
+
+| Risk | Probability | Impact | Mitigation |
+| --- | --- | --- | --- |
+| Accidental logic change while editing God fragments | Medium | High | Keep PRs to layout/dimen/adapter-bind changes only; reviewers reject logic diffs; regression test ticket → payment flow |
+| Visual regressions missed (no UI tests) | High | Medium | Before/after screenshots per PR on all target devices; snapshot tests for shared components |
+| Spacing differs by device because of px values and sdp scaling | High | Medium | Convert all in-scope px to dp tokens; QA on every supported POS resolution |
+| Header/drawer changes break non-register screens | Medium | Medium | Include Dashboard, Settings, Orders Hub, Gift Card and Cash Drawer in QA |
+| Device info shows wrong status (I-6, 60s polling) | High | Medium | Fix I-6; label status with clear states; accept ≤60s staleness or agree it with product |
+| Dialog migration changes dismiss/cancel behaviour | Medium | Medium | `PosDialogFragment` keeps each dialog's current `cancelable` value and callbacks |
+| Scope creep from "all pop-ups across POS" (108 layouts) | High | High | Agree the exact pop-up and dropdown list with product before Phase 4 (see Open Questions) |
+
+**Rollback strategy**
+
+- Client-only and no data change, so rollback means reverting the area's PR or halting the release rollout.
+- One PR per phase means one area can be reverted without affecting the others.
+
+**Monitoring plan**
+
+- Watch Crashlytics/New Relic for `BadTokenException`, `WindowLeaked` and `IllegalStateException` (fragment state) after release. These should go **down** after I-5.
+- Log a New Relic event when the drawer opens, with the device-status snapshot, to verify the status shown.
+- Track UI-consistency QA defects against the PRD target (0 open).
+
+---
+
+## 8. Open Questions (blocking sign-off)
+
+1. **Pop-up scope:** does "all pop-ups across POS" mean every dialog (108 layouts, including Cash Drawer, Settings and Menu Manager), or only those on Ticket, Menu and Payment?
+2. **Dropdown scope:** same question. Cash Drawer and Table Builder dropdowns are outside Ticket, Menu and Payment.
+3. **Connected device info:** which devices should be shown (printers, card terminal, KDS, network, customer display)? Show device name, status only, or both? Is ≤60s staleness acceptable?
+4. **Dismiss pattern:** should the standard pop-up keep the close-X, the "Go back" button, or both? (59 dialogs have both today.)
+5. **Header changes on other screens:** confirm the new header should also apply to Dashboard, Settings, Orders Hub, Gift Card and Cash Drawer.
+6. **Target devices:** list the POS resolutions/densities QA must sign off on.
+7. **Figma:** confirm the linked file is final for all six areas. The PRD still says "attach design screenshots".
+
+---
+
+## 9. Final Approval
+
+| Role | Approval |
+| --- | --- |
+| Engineering Manager Approval | |
+| Platform Lead Approval | |
+| Squad Lead Approval | |
+| Product Acknowledgment | |
+| Date | |
