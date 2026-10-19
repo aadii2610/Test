@@ -1,8 +1,7 @@
-# Tech Analysis — Ticket, Menu & Payment UI/UX Clean Up
+# Tech Analysis — Send to Kitchen Post Payment (QSR)
 
-**PRD:** [PRD: Ticket, Menu & Payment UI/UX Clean Up](https://app.notion.com/p/aio-app/PRD-Ticket-Menu-Payment-UI-UX-Clean-Up-3bb5b13baaa381be9759de090c2ff949)
-**Figma:** [POS Menu – Ticket](https://www.figma.com/design/kvAxOA6nKvmsLCFKsUUkGp/POS-Menu---Ticket?node-id=16108-26229&t=TSFi3iXvvx3K6wFo-1)
-**Status:** Pre-implementation analysis. No code changed yet.
+**CR:** [CR: Send to Kitchen Post Payment](https://app.notion.com/p/aio-app/CR-Send-to-Kitchen-Post-Payment-3b25b13baaa38013a4fdecf2f73afb36)
+**Status:** Pre-implementation analysis. No code changed.
 
 ---
 
@@ -11,107 +10,68 @@
 | Field | Value |
 | --- | --- |
 | **Jira Ticket** | *(pending)* |
-| **Feature Name** | Ticket, Menu & Payment UI/UX Clean Up |
-| **Module / Layer Affected** | **UI only** (`:pos` layouts, adapters, fragments). One small **Data/UI-state** addition for connected-device info in the hamburger panel. |
+| **Feature Name** | Send to Kitchen Post Payment (QSR) |
+| **Module / Layer Affected** | **Cross-module.** UI + Domain (`TicketFragment`, `QsrTicketViewModel`), Data (queue handler, settings), external SDK (`aio.app.common:restaurant`), WebDash, and likely Backend. |
 | **Tech Lead / Owner** | *(pending)* |
-| **Estimated Complexity** | **L3**. No business logic changes, but it touches 6 surfaces, ~100+ layout files, and spacing that is partly set in Kotlin. |
-| **Initial Risk Level** | **Medium**. Wide visual blast radius, no UI/screenshot tests, and several God fragments. |
-| **Dependencies** | **Internal:** Figma sign-off, `HeaderFragment`, `left_nav_menu.xml`, `DeviceStatusViewModel`, `DialogExtensions.kt`. **External:** none. No API or backend change. |
-| **Target Release Date** | Release 8.0 |
+| **Estimated Complexity** | **L3** |
+| **Initial Risk Level** | **High**. Changes when an order reaches the kitchen. A bug means orders never reach KDS, or are sent twice. |
+| **Dependencies** | **External SDK:** `restaurant:0.0.32` must add the flag. **Backend/WebDash:** new setting, and confirmation of the `qsr-create` behavior in §2.1. **Internal:** `PaymentViewModel`, API queue. |
+| **Target Release Date** | *(pending)* |
 
-### Business Context
+**Problem:** In QSR, tapping Card / Cash / Others sends the ticket to the kitchen before payment. Restaurants cannot choose to wait for payment.
 
-- **Problem:** Header, ticket pane, Menu screen, dropdowns, hamburger panel and pop-ups use different spacing and design patterns, so the POS feels fragmented.
-- **User impact:** POS staff (QSR/TSR) and managers get a consistent, easier-to-read UI. The hamburger panel also shows which devices are connected.
-- **Success criteria (from PRD):** 0 open UI-consistency QA defects, and 100% of impacted dropdowns and pop-ups follow the single design standard before 8.0 sign-off.
+**Expected behavior (from CR):**
+- New WebDash > POS Settings toggle **"Send to Kitchen post payment"**, default **Off** (today's behavior).
+- **On:**
+  - Card / Cash / Others no longer send to the kitchen.
+  - **Save & Send stays** (needed for phone orders).
+  - When the ticket becomes **Paid** (single full payment, or partial payments through completion), the order is sent to KDS and the kitchen printer auto-prints.
 
-### Scope by area
-
-| Area | Main code | Shared or duplicated |
-| --- | --- | --- |
-| Header | `HeaderFragment.kt` + `fragment_header.xml` | **Shared.** One fragment used by Register, Dashboard, Settings, Orders Hub, Gift Card and Cash Drawer. |
-| Ticket pane | `TicketFragment.kt` + `TicketMultiViewAdapter` + 5 `ticket_*_item_layout.xml` | **Shared** by QSR and TSR, but the 5 status row layouts are near-copies. |
-| Menu screen | `QsrMenuFragment` + `qsr*` adapters / `TsrMenuFragment` + `tsr*` adapters | **Duplicated.** QSR and TSR are separate stacks. |
-| Payment | `PaymentParentFragment`, `TicketPanFragment`, `BillFragment`, `PayBy*Fragment` | Own layouts and own ticket row (`row_items_bill.xml`). Shares nothing with Ticket/Menu. |
-| Dropdowns | 5 different mechanisms (see §2.4) | **Ad hoc.** No shared component. |
-| Hamburger panel | `left_nav_menu.xml` inside a `NavigationView` | Layout is **shared**. The drawer container and click wiring are **copied into 6 activities**. |
-| Pop-ups | 63 `DialogFragment`s + 54 raw `Dialog`s, 108 dialog layouts | **Ad hoc.** No base dialog class. |
+**Success criteria:** With the toggle on, no kitchen send before Paid, exactly one send after Paid, and Off behaves exactly as today.
 
 ---
 
 ## 2. Existing Code Review
 
-### 2.1 Architecture & Layering
+Paths below are under `pos/src/main/java/aio/app/pos/`.
 
-- **Header is in good shape.** It is one `HeaderFragment` added in code to `headerFrameLayout` in each activity (e.g. `RegisterActivity.kt:600`), so a single change covers every screen.
-- **The hamburger drawer is copied.** The `NavigationView` is declared in 6 activity layouts, and each activity wires drawer clicks itself (`RegisterActivity.setupDrawerClicks()` ~L1100, plus Dashboard, Settings, OrdersHub, GiftCard, CashDrawer). Changing the drawer's items or structure means touching all 6. Spacing-only changes in `left_nav_menu.xml` need just one edit.
-- **Menu layout is built in Kotlin, not XML.** RecyclerViews, LayoutManagers, span counts, heights and margins are created in code:
-  - QSR: `QsrHandlerImpl.kt:66, 93–102, 255–279`, `QsrMenuRepoImpl.kt:758–785`
-  - TSR: `TsrMenuManagerImpl.kt` (L106–559, heights `740`/`110` px), `TsrModifierManagerImpl.kt:120`
-  - Shared helpers: `ErrorStrings.kt:1334–1388`, which calls `setPadding(20, 5, 20, 5)`
+### 2.1 How "send to kitchen" works today
 
-  **XML-only spacing changes will not fix the Menu screen.**
-- **The ticket row is not composed from views.** Modifiers, special request and discount are drawn as one `TextView` using `SpannableStringBuilder`, `"\n"` and `LeadingMarginSpan` (`Utils.kt:151, 200, 667`). Spacing here is controlled in code.
-- **There is no design system.** The theme is `Theme.MaterialComponents.Light.NoActionBar` with 59 ad-hoc styles. Spacing is a mix of sdp/ssp (`_12sdp`), literal dp (~8,300 across 494 layouts) and a 20-entry `dimens.xml` with no spacing scale. There is no Compose.
+- **The POS has no separate KDS call.** "Send" means posting the ticket to `POST /api/ticket/qsr-create/{id}` (`network/ApiService.kt:389`) with item status `send`. The backend then pushes to KDS and returns the kitchen print job over MQTT (`UpdateTicketRepositoryImpl.handlePrintKDSPrintReceipt`).
+- **Save & Send:** `TicketFragment.kt:455` → `QsrTicketViewModel.validateButtonSendAndStayPayQsr` (~L687) → `postQsrTicketToServer(isForButtonSaveAndSend = true)` (L488) → queue task `SAVE_SEND_QSR` → `ApiQueueManagerRepoImpl.handleSaveAndSend` (L2839).
+- **Payment buttons also send.** `TicketFragment.kt:3124` → `handlePaymentButtonClick` (`QsrTicketViewModel.kt:110`) → `btnPayLogicForQsr` → `validateButtonPayQsr` (L626) → `postQsrTicketToServer(isForButtonSaveAndSend = false)` → queue task `PAY_TICKET_QSR` → `handleQsrPay` (`ApiQueueManagerRepoImpl.kt:2751`).
+  - `validateButtonPayQsr` reuses `isAllSendToKDS()` and `updateDbFirstQsr()`. It flips pending items to `send` in the same `qsr-create` request. **This is the implicit send-on-pay to remove.**
+- **Existing similar flag:** `confirmSendToKdsOnPaymentQsr` (`BusinessIdUseCase.kt:558`) only shows a "send items to KDS and proceed?" dialog (`QsrTicketViewModel.kt:113`). It does not change what gets sent.
 
-### 2.2 Concurrency & Coroutines
+### 2.2 Where the ticket becomes Paid
 
-- No coroutine work is required for a visual change.
-- **Connected-device state is fragmented and partly broken** (relevant to the hamburger "connected device info" story):
-  - `DeviceStatusViewModel` exposes booleans only (`isInternetConnected`, `isKDSConnected`, `isPaymentTerminalConnected`) plus `printerErrors: StateFlow` (printer names). No source gives "device name + status" for every device.
-  - **Bug:** `DeviceHeatBeatHelper` sends terminal/printer status via `LocalBroadcastManager` (L190), but `BaseActivity.kt:251` registers with `Context.registerReceiver`. LocalBroadcastManager broadcasts never reach that receiver, so `isPaymentTerminalConnected` is likely never updated.
-  - `Constants.terminalStatus` is a global `@Volatile var` read by Bill, Ticket and PayByCard fragments. No writer was found in `:pos` apart from the reset in `Application.kt:294` (it may be set from a library; needs checking).
-  - `HeartBeatViewModel` holds a second, parallel `DeviceStatuses` LiveData. `SharedDataRepositoryImpl._terminalStatus` exists but nothing collects it.
-  - Printer and terminal health is **polled every 60s** (`SharedDataRepositoryImpl.kt:360–378`), so the status shown can be up to 60s old.
+- **The server decides Paid.** The POS only receives `paymentStatus` (`full-paid`, `partial-paid`, …; `BackendPaymentEnum`).
+- **Four UI completion paths plus MQTT:**
+  - Cash: `PayByCashFragment.processPaymentResponse` (L330)
+  - Tender: `PayByTenderFragment` (L290)
+  - Card (Stripe/Adyen): `PayByCardFragment.processPaymentResponse` (L478)
+  - Gift card: `PayByGiftCardFragment`
+  - Other devices: `UpdateTicketRepositoryImpl` (~L1300) emits `MqttEvent.PaymentDone`
+- **Shared choke point:** the Success branch of `PaymentViewModel.authorisePayment` (`viewmodels/PaymentViewModel.kt:162–340`). It is shared with TSR, so any hook must be gated on QSR (`IS_QUICK_SERVE`).
+- QSR has no split ticket (`btnSplitTicket` is hidden, `TicketFragment.kt:1240`).
 
-### 2.3 Data Layer
+### 2.3 Settings chain (template: `isStayQSREnabled`)
 
-- **No Room, API or DTO changes.**
-- The terminal reader name/serial is only fetched ad hoc in `TerminalStatusDialogFragment.kt` (~L97, 143, 233–271). Showing a terminal name in the hamburger panel needs a small repository-level source for it.
+- Backend JSON → `RestaurantResponseDTO` → `RestaurantBO` → Room `RestaurantEntity` → `BusinessIdUseCase` (reads `aioRestaurant.appState.value.data?.restaurant?.…`).
+- These classes live in the **external SDK `aio.app.common:restaurant:0.0.32`**, not in this repo. A new flag needs an SDK release (DTO, BO, Entity, mappers, DB migration) and a version bump in `pos/build.gradle`.
+- Refresh is on onboarding / `onRestaurantByDeviceId`. There is **no MQTT settings push**, so a toggle change reaches the POS only on the next refresh.
+- **Risk:** in 0.0.32, `confirmSendToKdsOnPaymentQsr` exists in the DTO and BO but not in `RestaurantEntity` or its mappers, so it may read `false` after loading from Room. The new flag must be checked end-to-end.
 
-### 2.4 UI & State Management
+### 2.4 Concurrency, Data, Reliability (only what matters here)
 
-- **Header height conflict:** the activity container is sized by a guideline (`constraintGuide_percent="0.075"`, `activity_register.xml:41`), but the `fragment_header.xml` root is hardcoded to `100dp`. The two can disagree depending on screen size.
-- **Screen sub-bars diverge:** QSR `clTop` (wrap_content, sdp margins) and TSR `clTop` (fixed 60dp, 12/16/20dp margins) are different layouts.
-- **Dropdowns — 5 mechanisms, no shared component:**
-
-  | Mechanism | Count | Key call sites |
-  | --- | --- | --- |
-  | `PopupWindow` | ~15 | `QsrMenuRepoImpl.kt:193` (Menu), `SearchFragment`, `CustomItemRepoImpl`, `OnlineOrdersPopUpHelper`, cash-drawer screens |
-  | `ListPopupWindow` | 4 | NoSale, PayOut, CashIn, CashOut |
-  | `PopupMenu` | 3 | `TicketFragment.kt:1355, 4050, 4349` (options, tax, check) |
-  | `Spinner` | 2 | Table builder screens |
-  | Exposed dropdown | 3 | Menu Manager item edit |
-
-  - The **header dropdown is built two ways** from the same `dropdown_layout.xml`. RegisterActivity shows it as a full-screen raw `Dialog` (`DialogExtensions.kt:1096`). The other 5 activities use an `<include>` toggled by visibility.
-  - There are 4 competing styles: `PopupMenuStyle` (M3), `Widget.App.PopupMenu` (MDC), `SpinnerStyle` (AppCompat), `ItemEditDropdownLayoutStyle`.
-- **Pop-ups — no standard:**
-  - 63 `DialogFragment`s, 54 raw `Dialog`s (18 in `DialogExtensions.kt`, 8 inline in `RegisterActivity`) and 3 `AlertDialog.Builder`s.
-  - Window width is set in code with 10+ different ratios (0.25 → 0.85). `setLayout(` appears in 72 files.
-  - 59 of 108 dialog layouts have **both** a close-X and a "Go back" button.
-  - Button order is mostly Cancel-left / Positive-right. `layout_multiple_device_popup.xml` stacks them vertically instead.
-  - The best existing base is `DiscardConfirmDialogFragment` + `dialog_discard_confirm.xml` (title / message / cancel | confirm) and `commons/.../DialogSizing.kt` `centerWithSize()`.
-
-### 2.5 Performance & Memory
-
-- **Raw-px spacing set in code:** `setMargins(7, 7, 7, 7)` / `(7, 10, 7, 10)` in nearly every TSR and tiled adapter (`TsrItemsAdapter:84`, `TiledItemsAdapter:56`, `QsrItemAdapter:59`, …). These are pixels, not dp, so gaps change with screen density. They must be converted for spacing to be consistent.
-- **Ticket and modifier lists use `notifyDataSetChanged`** (`TicketMultiViewAdapter:76, 87`, all QSR/TSR modifier adapters). Not caused by this work, but full rebinds can cause flicker that QA may log as layout defects.
-- **Dialog leak / crash risk:**
-  - None of the 20 `Activity.*` dialog extensions in `DialogExtensions.kt` checks `isFinishing`/`isDestroyed`, and `BadTokenException` is never caught.
-  - Extension dialogs are local `val`s, so nothing can dismiss them in `onDestroy`.
-  - `RegisterActivity.onDestroy` dismisses only the break dialog. `voidOrderDialog`, `sendToKdsWarningDialog`, `receiptDialog` and `managerApprovalDialog` are not dismissed.
-  - 171 `DialogFragment.show()` calls have only 27 `isStateSaved` checks.
-
-### 2.6 Reliability & Stability
-
-- **Large files on the change path:** `RegisterActivity` 4938 lines, `TsrMenuFragment` 4782, `TicketFragment` 4669, `ErrorStrings.kt` 4672, `QsrMenuFragment` 3783, `BillFragment` 2613, `TicketPanFragment` 2512, `PayByCardFragment` 2146. The risk of an accidental logic change while editing layouts is real.
-- **Bug:** `left_nav_menu.xml:183` contains stray text `tvQuickServe` before the Settings `<TextView`.
-- Crash/ANR data (last 30–90 days) for the dialog paths above: *to be pulled from Crashlytics/New Relic before sign-off.*
-
-### 2.7 Test Coverage
-
-- **No UI or screenshot tests.** The only instrumentation test is `ExampleInstrumentedTest`. There are 5 unit test files in total, none covering UI.
-- Robolectric, Paparazzi and Roborazzi are not set up. Visual regressions will only be caught by manual QA.
+- **Offline-first write:** `updateDbFirstQsr()` writes `send` to Room before the API call. The post-payment send must not leave Room saying `send` while the server never received it.
+- **Payment calls are online API calls. Only the ticket create (`PAY_TICKET_QSR`) is queued.**
+- **Failures:** `handleTaskFailure` (L2692) marks the task failed and resyncs. `whenQsrFailFallBackToPreviousState` (L3290) resets items to `pending`, retried up to 3 times (`MAX_RESET_TO_PENDING_ATTEMPTS`). There is no KDS-specific retry.
+- **Double-send protection** is client-only: `DoubleTapCheckClickListener` and the `pending` → `send` check. There is no server dedupe.
+- **Partially paid QSR tickets are locked in the UI** (`checkPartiallyPaidOrder`, `QsrMenuFragment.kt:1557`), so items can't be added after payment starts unless a refund/void unlocks the ticket (not verified).
+- **Kitchen print result is not tracked by the POS**, because printing comes back over MQTT.
+- **Tests:** none for send-to-kitchen or payment completion. The only unit tests are `ApiQueueRetryLimitTest`, `TicketMappersTest`, `MenuRefreshPocTest`, `ExampleUnitTest`.
+- `TicketFragment` is ~4,500 lines.
 
 ---
 
@@ -119,20 +79,14 @@
 
 | # | Category | Issue | Severity | Risk Impact |
 | --- | --- | --- | --- | --- |
-| I-1 | UI / Performance | Menu and adapter spacing set in Kotlin in **raw px** (`setMargins(7,…)`, `setPadding(20,5,20,5)`, heights `740`/`110`) | High | Spacing cannot be made consistent through XML alone and looks different on each density |
-| I-2 | Architecture | No spacing tokens or text styles. sdp, literal dp and a 20-entry `dimens.xml` are mixed | High | Without a single source of truth the clean-up will drift again |
-| I-3 | Architecture | No standard dialog component. 54 raw `Dialog`s, 63 `DialogFragment`s, 10+ width ratios | High | Directly blocks the "pop-up consistency" story |
-| I-4 | Architecture | No standard dropdown. 5 mechanisms and 4 styles; header dropdown built two ways | High | Directly blocks the "dropdown consistency" story |
-| I-5 | Memory / Crash | Raw dialogs shown without `isFinishing` guards and not dismissed in `onDestroy` (`DialogExtensions.kt`, `RegisterActivity`, `PayByCardFragment.reinitializingDialog`, `AddTipUnclosedFragment.tipDialog`) | High | Window leaks and `BadTokenException` crashes |
-| I-6 | Reliability | Terminal status receiver registered with `registerReceiver` but sent via `LocalBroadcastManager` (`BaseActivity.kt:251` vs `DeviceHeatBeatHelper.kt:190`) | High | The hamburger panel would show a wrong/stale terminal status |
-| I-7 | Architecture | Device status split across `DeviceStatusViewModel`, `HeartBeatViewModel`, `Constants.terminalStatus` and unused `_terminalStatus`. No name + status model | Medium | Connected-device info needs a new unified source |
-| I-8 | UI | Header height: guideline 7.5% vs hardcoded `100dp` root | Medium | Header clipping or gaps on some screen sizes |
-| I-9 | Architecture | Ticket status row layouts are 5 near-copies, plus a separate payment row | Medium | Every spacing change must be repeated in ~6 files; easy to miss one |
-| I-10 | Architecture | Drawer container and click wiring copied into 6 activities | Medium | Structural drawer changes need 6 edits |
-| I-11 | UI | Modifier, special-request and discount spacing is Spannable text (`Utils.kt:151–202, 667`) | Medium | Spacing changes touch shared rendering used by several bindings |
-| I-12 | Bug | Stray `tvQuickServe` text in `left_nav_menu.xml:183` | Low | Possible visible artefact / lint error |
-| I-13 | Performance | `notifyDataSetChanged` on ticket and modifier lists | Low | Flicker; QA noise |
-| I-14 | Test | No UI/screenshot tests for any affected screen | Medium | Visual regressions only caught manually |
+| I-1 | Architecture | Send and Pay share one request path (`validateButtonPayQsr`, `isAllSendToKDS`, `updateDbFirstQsr`) and write `send` to Room before the call | High | Flag-on must skip the send without breaking payment or the ticket's local state |
+| I-2 | Backend | Unknown whether `qsr-create` accepts a payment-initiated create with items left `pending`, and whether the backend can send to KDS after Paid, or the POS must call again | **Critical** | Blocks the design (§4) |
+| I-3 | Data | New setting needs an external SDK release, DB migration and version bump; the existing similar flag may not persist in Room | High | Flag silently reads `false`; the feature never turns on |
+| I-4 | Architecture | Paid is detected in 4 fragments plus MQTT. Only `PaymentViewModel` is a common point | High | A missed path means an order paid but never sent |
+| I-5 | Concurrency | No server-side dedupe. Multiple devices/MQTT can both observe Paid | Medium | Duplicate kitchen tickets |
+| I-6 | Reliability | No KDS-specific retry. A failed post-payment send is silent to staff | High | Paid order never reaches the kitchen |
+| I-7 | Data | Settings refresh is on onboarding only (no push) | Low | Toggle change delayed on devices |
+| I-8 | Test | No tests on send or payment completion | Medium | Regression risk |
 
 ---
 
@@ -140,105 +94,78 @@
 
 | Issue | Fix now? | Justification | Backlog Ticket | Target Sprint |
 | --- | --- | --- | --- | --- |
-| I-1 Raw-px spacing in code | **Y** | Required to meet the PRD. Convert to `@dimen` tokens via `resources.getDimensionPixelSize` | — | *[Sprint]* |
-| I-2 Spacing tokens + text styles | **Y** | Foundation for every story. Add `dimens_spacing.xml` (4/8/12/16/24) and `TextAppearance.Pos.*` | — | *[Sprint]* |
-| I-3 Standard dialog | **Y** | Required by PRD. Build one `PosDialogFragment` + `layout_pos_dialog.xml` (title → body → Cancel \| Primary) | — | *[Sprint]* |
-| I-4 Standard dropdown | **Y** | Required by PRD. One `PosDropdown` helper (PopupWindow + shared style); migrate `PopupMenu`/`ListPopupWindow` sites in scope | — | *[Sprint]* |
-| I-5 Dialog leaks / crashes | **Y** | Governance: memory leak or crash → must fix. Covered for free by migrating in-scope dialogs to `PosDialogFragment`; add guards to the remaining raw dialogs we touch | — | *[Sprint]* |
-| I-6 Broadcast receiver mismatch | **Y** | One-line fix. Needed for correct device status in the hamburger panel | — | *[Sprint]* |
-| I-7 Unified device status model | **Y (scoped)** | Add a `ConnectedDevice(name, type, status)` list to `DeviceStatusViewModel` only. Do not remove `HeartBeatViewModel` or `Constants.terminalStatus` now | *[Ref]* (cleanup) | *[Sprint]* |
-| I-8 Header height conflict | **Y** | Header is in scope; single file | — | *[Sprint]* |
-| I-9 Merge ticket row layouts | **N** | Too risky for a visual-only PRD. Apply spacing tokens to each copy instead | *[Ref]* | *[Sprint]* |
-| I-10 Centralise drawer wiring | **N** | Only needed if drawer items change. PRD changes spacing and adds device info, both inside the shared include and `BaseActivity` | *[Ref]* | *[Sprint]* |
-| I-11 Spannable modifier text | **Y (values only)** | Replace the hardcoded `7f` dp indent and separator sizes with tokens. Do not restructure | — | *[Sprint]* |
-| I-12 Stray text in drawer XML | **Y** | Trivial, same file | — | *[Sprint]* |
-| I-13 `notifyDataSetChanged` | **N** | Not visual-scope. Log for performance backlog | *[Ref]* | *[Sprint]* |
-| I-14 Screenshot tests | **Y (scoped)** | Add Paparazzi/Roborazzi snapshots for the new shared components (dialog, dropdown, header, drawer) only. Screens stay manual QA | *[Ref]* (full coverage) | *[Sprint]* |
+| I-1 Split send from pay when flag on | **Y** | Core of the CR. Skip the `pending` → `send` flip in `validateButtonPayQsr` when flag on and QSR | — | *[Sprint]* |
+| I-2 Confirm backend contract | **Y (first)** | Must be answered before any POS work; may require a backend change | *[Ref]* | *[Sprint]* |
+| I-3 SDK flag + migration | **Y** | Required; must be released and tested before POS work | *[Ref]* | *[Sprint]* |
+| I-4 Single "Paid" hook | **Y** | Trigger the send from `PaymentViewModel` Success (QSR only); do not add per-fragment hooks | — | *[Sprint]* |
+| I-5 Dedupe | **Y** | Only send when the ticket still has `pending` items; ask backend for idempotency | — | *[Sprint]* |
+| I-6 Failure handling | **Y** | Reuse the queue retry; surface failure to staff and log to New Relic | — | *[Sprint]* |
+| I-7 Settings push | **N** | Out of scope; document the delay | *[Ref]* | *[Sprint]* |
+| I-8 Tests | **Y (scoped)** | Unit-test the decision "send on payment click?" and "send on Paid?" as pure functions | — | *[Sprint]* |
+
+**Governance:** Flag Off must not change any code path. No issue is ignored without a ticket.
 
 ---
 
 ## 5. Impact Assessment
 
 ### 5.1 UI Impact
-
-- **Layout changes:** yes, across header, drawer, ticket rows, QSR/TSR menu grids, payment panes and in-scope dialogs/dropdowns.
-- **Header and hamburger changes also apply to Dashboard, Settings, Orders Hub, Gift Card and Cash Drawer**, because they share `HeaderFragment` and `left_nav_menu.xml`. QA must cover those screens too.
-- **Navigation:** no change.
-- **State handling:** only the new connected-device list in `DeviceStatusViewModel`.
+- No layout change. Save & Send stays (removal was dropped from scope).
+- With the flag on, the "send to KDS and proceed?" dialog must not show, because nothing is sent at that point.
+- Staff need a clear signal that the order goes to the kitchen after payment (optional; confirm with product).
 
 ### 5.2 API Contract Impact
-
-- None.
+- Likely **yes**: new setting field on the restaurant response. Possibly a new or changed `qsr-create` behavior (I-2).
+- Versioning: older POS builds ignore the unknown field and keep today's behavior.
 
 ### 5.3 Database Impact
-
-- None. No schema change, migration or backfill. Rollback is safe.
+- New column on `RestaurantEntity` (in the SDK, DB version 32 → 33).
+- Migration needed. No backfill: default is `false`.
+- Rollback: harmless, since an unused column can stay.
 
 ### 5.4 Performance Impact
-
-- CPU and memory: neutral. Converting px to dimens is a lookup, and `PosDialogFragment` replaces existing dialogs one-for-one.
-- Network: none. Device status reuses existing heartbeats.
-- Startup: none.
-- Watch the drawer: observing device status must not re-inflate the drawer on every 60s heartbeat. Update only the status rows.
+- Negligible. One boolean read per payment tap and one existing API call, moved to a different moment.
 
 ### 5.5 Backward Compatibility
-
-- **Feature flag:** not practical for layout and spacing changes. Optional flag for the new device-info section only.
-- **Rollout:** ship per area as separate PRs inside 8.0 (see §6) so any one area can be reverted on its own.
-- Legacy: no data or behaviour change, so nothing to support.
-
----
-
-## 6. Proposed Implementation Plan
-
-| Phase | Work | Notes |
-| --- | --- | --- |
-| 0 | Foundation: spacing tokens, text styles, `PosDialogFragment`, `PosDropdown`, screenshot-test setup | No visible change on its own |
-| 1 | Header (I-8) + hamburger spacing + connected-device info (I-6, I-7, I-12) | Covers 6 activities |
-| 2 | Ticket pane: 5 status row layouts + Spannable spacing values (I-11) | Shared by QSR and TSR |
-| 3 | Menu screen: QSR, then TSR (I-1) | Largest effort; most spacing is in Kotlin |
-| 4 | Payment screens + migrate in-scope pop-ups and dropdowns (I-3, I-4, I-5) | Order: Ticket → Menu → Payment dialogs |
+- Default Off keeps current behavior on all devices.
+- Mixed fleet: devices on older builds keep sending on tap, so an Off/On mismatch is possible until all devices update.
+- Gradual rollout: toggle per restaurant from WebDash. No separate app feature flag needed.
 
 ---
 
-## 7. Risk Assessment
+## 6. Risk Assessment
 
 | Risk | Probability | Impact | Mitigation |
 | --- | --- | --- | --- |
-| Accidental logic change while editing God fragments | Medium | High | Keep PRs to layout/dimen/adapter-bind changes only; reviewers reject logic diffs; regression test ticket → payment flow |
-| Visual regressions missed (no UI tests) | High | Medium | Before/after screenshots per PR on all target devices; snapshot tests for shared components |
-| Spacing differs by device because of px values and sdp scaling | High | Medium | Convert all in-scope px to dp tokens; QA on every supported POS resolution |
-| Header/drawer changes break non-register screens | Medium | Medium | Include Dashboard, Settings, Orders Hub, Gift Card and Cash Drawer in QA |
-| Device info shows wrong status (I-6, 60s polling) | High | Medium | Fix I-6; label status with clear states; accept ≤60s staleness or agree it with product |
-| Dialog migration changes dismiss/cancel behaviour | Medium | Medium | `PosDialogFragment` keeps each dialog's current `cancelable` value and callbacks |
-| Scope creep from "all pop-ups across POS" (108 layouts) | High | High | Agree the exact pop-up and dropdown list with product before Phase 4 (see Open Questions) |
+| Paid order never reaches the kitchen (missed completion path or failed call) | Medium | **High** | One hook in `PaymentViewModel`; failure surfaced to staff; New Relic alert on "Paid, not sent" |
+| Order sent twice (retry, MQTT, multi-device) | Medium | High | Send only if `pending` items remain; backend idempotency |
+| Flag reads `false` because it isn't stored in Room | Medium | High | Verify Room persistence in SDK before POS work; add a test |
+| Backend rejects payment-initiated create with `pending` items | Unknown | **Critical** | Confirm with backend first (I-2) |
+| Partial payment already made, then ticket voided/refunded before Paid | Low | Medium | Agree behavior with product: no send until Paid |
+| Toggle changed mid-shift | Medium | Low | Takes effect on next settings refresh; document it |
 
 **Rollback strategy**
-
-- Client-only and no data change, so rollback means reverting the area's PR or halting the release rollout.
-- One PR per phase means one area can be reverted without affecting the others.
+- Set the toggle Off in WebDash for the restaurant. That restores current behavior without an app release.
+- If the POS change has a defect, halt the rollout or revert the PR. The SDK column can stay.
 
 **Monitoring plan**
-
-- Watch Crashlytics/New Relic for `BadTokenException`, `WindowLeaked` and `IllegalStateException` (fragment state) after release. These should go **down** after I-5.
-- Log a New Relic event when the drawer opens, with the device-status snapshot, to verify the status shown.
-- Track UI-consistency QA defects against the PRD target (0 open).
+- New Relic events: "post-payment send triggered", "send success", "send failed", "duplicate suppressed".
+- Alert on tickets Paid with items still `pending`.
 
 ---
 
-## 8. Open Questions (blocking sign-off)
+## 7. Open Questions (blocking)
 
-1. **Pop-up scope:** does "all pop-ups across POS" mean every dialog (108 layouts, including Cash Drawer, Settings and Menu Manager), or only those on Ticket, Menu and Payment?
-2. **Dropdown scope:** same question. Cash Drawer and Table Builder dropdowns are outside Ticket, Menu and Payment.
-3. **Connected device info:** which devices should be shown (printers, card terminal, KDS, network, customer display)? Show device name, status only, or both? Is ≤60s staleness acceptable?
-4. **Dismiss pattern:** should the standard pop-up keep the close-X, the "Go back" button, or both? (59 dialogs have both today.)
-5. **Header changes on other screens:** confirm the new header should also apply to Dashboard, Settings, Orders Hub, Gift Card and Cash Drawer.
-6. **Target devices:** list the POS resolutions/densities QA must sign off on.
-7. **Figma:** confirm the linked file is final for all six areas. The PRD still says "attach design screenshots".
+1. **Backend (I-2):** Does `qsr-create` accept a pay-initiated create with items left `pending`? After Paid, does the backend send to KDS by itself, or must the POS call again?
+2. **Failure UX:** If the post-payment send fails, what should staff see?
+3. **Void/refund:** If a partially paid ticket is voided before Paid, is anything sent?
+4. **Timing:** For a partial payment, confirm nothing is sent until the ticket is fully Paid.
+5. **Offline:** If the device is offline at the moment of Paid, is the send queued and retried later?
+6. **Printers:** Is "kitchen printer auto print" fully backend-driven (MQTT), or does the POS also print locally?
 
 ---
 
-## 9. Final Approval
+## 8. Final Approval
 
 | Role | Approval |
 | --- | --- |
