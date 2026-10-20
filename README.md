@@ -1,13 +1,8 @@
-# Tech Analysis — Gift Card CRs on POS: Digital Purchase, Merge, Migration to Digital, Reload
+# Tech Analysis — Busy Mode & Pause Orders (Kitchen Control)
 
-**PRDs (4 CRs, one analysis):**
-1. [Change Request: Digital Gift Card Purchase on POS](https://app.notion.com/p/aio-app/Change-Request-Digital-Gift-Card-Purchase-on-POS-3a85b13baaa380fbba46c2e96aad530d)
-2. [CR: Gift Card Merge on POS](https://app.notion.com/p/aio-app/CR-Gift-Card-Merge-on-POS-25-07-2026-3a85b13baaa38058a0d0ed5f4170b48d)
-3. [CR: Gift Card Migration to Digital on POS](https://app.notion.com/p/aio-app/CR-Gift-Card-Migration-to-Digital-on-POS-25-07-2026-3a85b13baaa38092879ced0cddc946d5)
-4. [CR: Gift Card Reload on POS](https://app.notion.com/p/aio-app/CR-Gift-Card-Reload-on-POS-25-07-2026-3a85b13baaa380a2ac51ef15af1b8f12)
-
-**Related:** `GIFT_CARD_VISIBILITY_AND_REFUND_TECH_ANALYSIS.md` (refund, same gift card code)
-**Scope of this doc:** POS (Android) only. Backend, E-card provider, Marketing ledger and Reports are dependencies.
+**PRD:** [Busy and pause order](https://app.notion.com/p/aio-app/Busy-and-pause-order-3a75b13baaa380448733d14f0a3f9f33)
+**Figma:** [POS Header](https://www.figma.com/design/iEsAO1rJawNNrqGLElWKTN/POS-Header?node-id=3151-11118)
+**Scope of this doc:** POS (Android) only. Backend and Kitchen Hub work is listed as dependencies.
 **Status:** Pre-implementation analysis. No code changed.
 
 ---
@@ -16,107 +11,87 @@
 
 | Field | Value |
 | --- | --- |
-| **Jira Ticket** | *(pending: one epic, four stories recommended)* |
-| **Feature Name** | Gift Card: Digital Purchase, Merge, Migration to Digital, Reload |
-| **Module / Layer Affected** | **Cross-module.** UI (gift card screens, customer-facing display "CFD"), Domain/Data (new gift card APIs and models), Payment (gift card ticket), Receipts, external services (E-card API, Marketing ledger, Backend). |
+| **Jira Ticket** | *(pending)* |
+| **Feature Name** | Busy Mode & Pause Orders (Kitchen Control) |
+| **Module / Layer Affected** | **Cross-module.** UI (Orders Hub), Data (new API calls), Backend (pause enforcement, Kitchen Hub proxy), Super Admin settings. |
 | **Tech Lead / Owner** | *(pending)* |
-| **Estimated Complexity** | **Epic L4.** Per CR: Digital Purchase **L4**, Reload **L3**, Migration **L3**, Merge **L3**. |
-| **Initial Risk Level** | **High**. Money, card balances and PINs; none of the four server APIs exists on the client. |
-| **Dependencies** | **E-card API** (card details + delivery), **Backend** (digital purchase, reload, merge, migration endpoints, templates, delivery), **Marketing module** (merge ledger event), **Reports** (reload impact), **Internal:** `GiftCardActivity`, `PaymentParentFragment`, CFD framework. |
+| **Estimated Complexity** | **L3** |
+| **Initial Risk Level** | **Medium–High**. Pausing a source stops real orders; a wrong or stuck pause loses sales. |
+| **Dependencies** | **Backend (critical):** new endpoints to read/set pause state per source, proxy to Kitchen Hub, enforce pause for AIO sources, auto-resume. **Kitchen Hub:** `PUT/GET /v2/integration_accounts/{integration_id}/status/`. **Super Admin:** online ordering flag. **Internal:** Orders Hub, permissions. |
 | **Target Release Date** | *(pending)* |
 
-### The four CRs at a glance
+### Business Context
 
-| CR | What it adds | Entry point | Needs |
-| --- | --- | --- | --- |
-| **Digital purchase** | Buy a digital card (design, amount, recipient, Email/Text delivery, message), full payment only, delivered by the E-card flow | New "Purchase Digital Card" button | 9 screens, design gallery, E-card API, CFD forms, validation |
-| **Merge** | Merge several cards (physical + digital) into one parent card | New "Merge Cards" button | Pop-up, parent/child rules, new merge API, ledger event |
-| **Migration to Digital** | Transfer a Toast/Cake card to a **digital** AIO card (today: physical only) | Existing transfer icon on the card row | Type chooser, name/phone/email form, E-card API, email with number + PIN |
-| **Reload** | Add value to an existing card from the POS and pay for it | New reload icon on the card row | Reload dialog, payment, receipt, multi-card flows |
+- **Problem:** During peak load or an outage there is no single place to slow down or stop orders from specific sources, which leads to missed SLAs, cancellations and a poor guest experience.
+- **User impact:** Managers pause or resume order sources from Orders Hub. Everyone sees what is paused at a glance.
+- **Success criteria:** A paused source stops receiving orders immediately and resumes on time; badges always match the real state.
 
-### Shared building blocks (why one doc)
+### Scope
 
-- **Same screens and files:** `GiftCardsMainFragment`, `GiftCardScannedFragment`, `GiftCardScannedAdapter`, `GiftCardBillFragment`, `LoadGiftCardDialog`, `TransferGiftCardDialog`, `PayBy*Fragment`.
-- **Same new dependencies:** the E-card API (purchase + migration), the CFD customer form (purchase + migration), email/phone validation (purchase + migration), and the bill/payment path (purchase + reload).
-- **Same blocker:** the scanned-card list and bill are hard-wired to `INVENTORY` ("New") cards. Reload, merge and migration all need other card sources to behave differently.
+| In scope (this release) | Deferred (PRD: "out of scope for now") |
+| --- | --- |
+| Kitchen control button + modal on Orders Hub | Auto-fire time (US-2, US-3) |
+| Pause / resume per source: **Grubhub, DoorDash, Uber Eats** (via Kitchen Hub), **Online Ordering (single card for pickup + delivery), Catering, Kiosk** (inside AIO) | Additional prep time on top of MOM base time (US-4) |
+| Pause until a time (15-min steps) or indefinitely (mutually exclusive); auto-resume | |
+| Save / Cancel; pre-populated from current state | |
+| Status badges on the Orders Hub main screen; read-only for other roles | |
+| Online Ordering card hidden when disabled in Super Admin | |
 
 ---
 
 ## 2. Existing Code Review
 
-Paths under `pos/src/main/java/aio/app/pos/` unless stated. `G/` = `ui/giftcard/`, `P/` = `ui/giftcard/presentation/`.
+Paths under `pos/src/main/java/aio/app/pos/` unless stated.
 
 ### 2.1 Architecture & Layering
 
-**What exists today**
+- **Nothing like Kitchen Control exists.** No busy mode, pause, store status, or Kitchen Hub status code was found in `pos` or `commons`.
+- **The POS never talks to Kitchen Hub directly.** The only Kitchen Hub references are two AIO backend endpoints (`PUT /api/kitchen-hub/respond-to-order`, `POST /api/kitchen-hub/update-delivery-status`, `ApiService.kt:863, 975`). There is one HTTP client pointing at the AIO backend; no Kitchen Hub client, URL or key on the device. **The PRD's Kitchen Hub status calls must be made by the backend**, so the POS needs new AIO endpoints.
+- **`integration_id` is in an SDK object the POS never reads.** `RestaurantFullBO.kitchenHubs` (external SDK `aio.app.common:restaurant:0.0.32`) carries `partnerName`, `integrationAccountId`, `kitchenHubStoreId`. `BusinessIdUseCase` is the natural accessor. The `partnerName` strings are unknown and must be confirmed with the backend.
+- **Closest precedent: the online-ordering toggle.**
+  - `GET/PATCH /api/online-ordering-settings` (`ApiService.kt:635–641`), logic in `OrdersHubViewModel.kt:362–403`, UI is the "Online Orders On/Off" button in `SearchFragment` and an overlay `online_orders_new_dialog.xml` driven by `OrdersHubParentActivity.setOnlineOrderingSwitch()` (L2072–2096, duplicated in `GiftCardActivity`).
+  - The response also has pickup, delivery and restaurant timezone fields, but only `id` and `enableOnlineOrdering` are mapped.
+  - **It overlaps with the new Online Ordering pause card** and the Super Admin flag. Their relationship is undefined (see §7).
+- **Orders Hub layout:** top strip is `SearchFragment` (`fragment_search.xml`), which already holds the Online Orders button and the order-delay selector. A "Kitchen control" button and badges fit there. The global header (`HeaderFragment`) is shared with Gift Card screens and already carries blinking Online/3PO count badges.
+- **Modal style:** two precedents (in-activity overlay, or a `DialogFragment` such as `ManagerApprovalDialog`). **No hour/min/AM-PM picker exists** in the codebase (only a numpad time entry).
+- **Large classes on the path:** `OrdersHubParentActivity` 2,961 lines, `ApplicationRepositoryImpl` 2,497, `OrdersHubTicketsFragment` 1,620, `HeaderFragment` 759. New code should go into new files.
 
-- **Landing screen** (`P/GiftCardsMainFragment.kt`, 330 lines): scan area and "Enter card number manually" only. There are **no Purchase Digital or Merge buttons.** A hidden `btnSwitchToGuest` exists.
-- **Scanned list** (`G/adapters/GiftCardScannedAdapter.kt`): `INVENTORY` cards show an editable amount row ("New"). **Every other source gets a Transfer-only row** (transfer, print, remove). There is **no reload icon**.
-- **Transfer** (`G/dialogs/TransferGiftCardDialog.kt`): `POST /api/gift-card/transfer-balance` with `{fromCardNumber, toCardNumber}`. The **target must be an `INVENTORY` card**. There is **no physical/digital chooser**. Transfer is disabled for `DIGITAL` cards, for already-transferred cards and for zero balance.
-- **Reload is blocked in six places** by `INVENTORY`-only filters: `GiftCardScannedFragment.updateBillFragment` (L872–890), the adapter view type (L30), `updateAllNewCards`, remove handling (L125), `addCardItem` (L467–480), and the receipt filters in `PayByCard/Cash/Tender/GiftCardFragment`.
-- **Merge:** the words merge/parent/child **do not exist** in the gift card code.
-- **Gift card bill:** `GiftCardBillFragment` sums the bill items, applies an optional dollar/percent discount to the whole subtotal, then `PATCH /api/gift-card/ticket`, then hands over to the payment fragments through bundle args (`isFromGiftCard`, `giftCardTicketId`). **The gift card ticket is not in Room.**
-- **Payments for a gift card ticket:** full payment is already enforced (`BillFragment.setupGiftCardFlow` ~L685–740: split/partial widgets hidden, status = paid). Methods: Cash, Tender, Card and Manual Card (terminal ready and amount ≥ 0.50; manual needs `ADYEN_AMS`), Gift card (as tender). **This part of the Digital Purchase CR already exists.**
-- **E-card:** `isECardEnabled` is only a restaurant flag that gates the gift card menu. **No E-card endpoint, DTO, design/template/category list or image loading exists.** The word "ecardsystems.net" appears only in a barcode URL parser.
-- **Data model for delivery** (`UserGiftCardPayment`: purchased_by_*, recipient_*, message, security_code) is **read-side only**. `GiftCardTicketRequestDTO` carries only `cardNumber`, `topupAmountInCents`, `giftCardId`, so **recipient, delivery method and message cannot be sent today**.
-- **Reload fields already exist in DTOs** (`topupAmountInCents`, `existingBalanceInCents`), but the UI only echoes them when restoring a ticket.
+### 2.2 Concurrency
 
-### 2.2 CFD (customer-facing display)
+- **Multi-device state:** there is **no settings-sync event**. MQTT has no `UPDATE_*_SETTINGS`; `BUSINESS_HOURS_UPDATE` exists but its handler only acknowledges. The restaurant info cache refreshes only at splash and clock-in.
+- Two devices can show different states, and there is **no concurrency token**, so last write wins. "Pre-populated with the current state" (US-1) therefore needs a **fresh GET on every open**.
+- **Save across 3 providers is not atomic.** Each Kitchen Hub PUT is separate, and GET can return `unknown`. Per-source results and partial failure must be handled and shown.
+- **Auto-resume cannot run on the device.** There is no WorkManager. The only scheduler is `AlarmManager` for close-out. Auto-resume must be backend-side (Kitchen Hub `pause_duration`, backend timestamp for AIO sources) and the POS only reads it.
 
-- **Same device, same process.** The CFD is an Android `Presentation` on a second display (`SecondaryScreenPresentation`). Handoff is `SecondaryScreenHandler` with a UI-state flow (replay 1) and a user-action flow (**no replay, no buffer**).
-- **Adding a form needs:** a new `SecondaryScreenUiState`, a new `UserAction`, a branch in the Presentation, and a collector in the host fragment.
-- **Precedents for customer-entered values:** `IdleMarketingSecondaryScreen` (name + phone + consent), `LoyaltyLoginSignupFormSecondaryScreen`, `ReceiptSecondaryScreen` (email), and gift card number/PIN entry in `PayByGiftCardFragment`. The gift card CFD flow is **quick-serve only** (TSR uses the POS screen).
-- **Keyboard:** the CFD uses an external custom keyboard AAR (`aio.app.keyboard:keyboard:0.0.16`) through `KeyboardConfig.setUpKeyBoard`, not the system keyboard.
-- **Waiting state:** `CardPaymentProcessing` shows "Guest is entering…" with a Skip button and a switch-back button. Tip and gift card entry have **no timeout**; the cashier cancels.
-- **CFD is optional:** `isSecondaryScreenEnabled` is a restaurant setting; fragments never check whether a display is attached. With the setting on and no display, the state is emitted and **nobody renders it** (no automatic fallback).
-- **Label mismatch:** the PRD says "Switch to CFD"; the existing button is "Switch to guest".
-- **Multi-step form on the CFD (name, recipient, delivery, message) does not exist** and must be built (the PRD calls for 3 CFD screens in the purchase flow, 2 in migration).
+### 2.3 Data Layer
 
-### 2.3 Concurrency
+- **Absolute time, not local time.** Device time zone is used almost everywhere (clock, `toUtcDateTime`). Restaurant time zone exists (`BusinessIdUseCase.getTimeZone()`, default `America/New_York`) but is effectively unused. `toUtcDateTime` converts a time to **today's date only, with no midnight rollover**, and there is no clock-drift handling. A "paused until 12:15 AM" picked at 11:50 PM would break.
+- **Kitchen Hub takes seconds** (`pause_duration`). The PRD says AIO computes "now to selected time", so the computation must use one agreed clock (server time) to avoid drift between device and server.
+- **Super Admin flags exist in the SDK but the POS barely uses them:** `onlineOrder`, `isPickupEnabled`, `isDeliveryEnabled`, `isCateringEnabled` are on `RestaurantBO`, but `RestaurantFeatureFlag` defaults are `false` and are never read. **There is no kiosk-enabled or catering-enabled setting read anywhere.** The authoritative online ordering flag today is `enableOnlineOrdering` from the online-ordering-settings API.
+- **No accept/reject gate on the POS for online, kiosk or catering orders.** The POS only receives them (MQTT `ONLINE_ORDER`). Pause for AIO sources must be enforced by the backend, which this analysis cannot confirm.
+- **Order source strings:** `OrderHubSourceEnum` has `doordash`, `uber-eats`, `grub-hub`, `website`, `website-catering`, `kiosk`. `SearchFiltersDialog` uses the key `"grubhub"` and maps it to `"grub-hub"` (`OrdersHubFilterRepoImpl.kt:91`). New code should use the enum. `isThirdPartyOrder()` is copy-pasted in 5 places.
 
-- `giftCardValidateResponse` in `TsrTicketViewModel` is a `SharedFlow(replay=0)` with **four collectors**, and a scan in any dialog also feeds the scanned list. **A merge dialog that scans cards must not share this flow**, or the scanned fragment will also add the card.
-- A late collector misses events: `GiftCardsMainFragment.observeCurrentTicket` (L255) can miss the `getCurrentGiftCardTicket` response fired in `GiftCardActivity.onCreate` (L270), leaving `ticketId` null and **Pay failing with "Ticket ID not found"**.
-- CFD user actions are emitted on a global scope into a **no-replay** flow, so an action is **dropped if no collector is active**. Several screens collect the same flow (`RegisterActivity`, payment fragments, `LoyaltyMenuDialogFragment`).
-- Gift card settings (min, max, presets) are fetched in `RegisterActivity` (L615–617), but `GiftCardActivity` is reachable from other drawers, so `LoadGiftCardDialog` **may get empty settings** and then skips range validation.
+### 2.4 UI & State Management
 
-### 2.4 Data Layer
+- **Existing precedent has a bug.** The online-ordering toggle sets the UI state **before** the API call, and on failure only shows a snackbar, so the state is never reverted (`SearchFragment.kt:146–153`). The new modal must not copy this: Save should apply the state only after success.
+- Modal needs: per-source card, toggle, "Paused until" picker (15-minute steps), "Paused indefinitely" checkbox (mutually exclusive with the time), Save and Cancel (Cancel discards all edits), loading state while fetching status, and an `unknown` state.
+- **Badges:** show one badge per paused source, next to the Kitchen control button. Must update after save and after a refresh from the server (a source that auto-resumed must lose its badge without user action, which needs a refresh trigger).
+- **Permissions:** features are backend-driven keys in `AllowedFeature` (`AuthEnum`, checked with `Utils().checkFeature`). **There is no Kitchen Control key**, so a new one is needed. `RolesEnum` has `MANAGER`, `OWNER` and `SHIFTORASSISTANTMANAGER`; **no role is named "Shift Lead"** (the PRD note itself asks for the role names to be confirmed). No read-only-vs-edit pattern exists; only show/hide.
 
-- **Not found:** E-card, digital purchase, reload, merge and migration endpoints. Existing gift card APIs: validate (+PIN), ticket create/update/delete/current, transfer-balance, settings, process-payment, receipt (`ApiService.kt:903–972`).
-- `createGiftCardTicket` is declared but **never called from the UI**.
-- `GiftCardSettingsDTO.presetAmounts` is `List<Int>` and `LoadGiftCardDialog` works on **whole numbers only** (max 6 digits). PRD presets differ: purchase $25/50/100/150, reload $25/50/100/200 (settings supply a list; the dialog keeps at most 5).
-- **Discount** math is duplicated in three places (`GiftCardBillFragment.kt:213, 626`, `GiftCardActivity.kt:452`). The PRD says a gift card purchase discount also applies to reload amounts, which is already true because the discount applies to the whole bill subtotal once reload lines can enter the bill.
-- `replaceCard` (after transfer) builds a new item **with no source, giftCardId or amount**.
-- **Commission split:** no "commission" code exists. The gift card card-payment path hard-codes `applicationFeeInCents = 0` and `discount = "0"` (`PayByCardFragment.kt:1811, 1822, 1842`). The Reload CR says "the configured POS commission split will be applied".
+### 2.5 Performance & Memory
 
-### 2.5 UI & State Management
+- One GET per provider on open (up to 3 Kitchen Hub calls, via the backend). Fetch in parallel with a timeout; the HTTP client timeout is 12 s.
+- No other performance concerns.
 
-- Scanned list and bill state are **synced manually** between adapter and `GiftCardViewModel` (`syncRepositoryWithAdapter`, `updateBillFragment`).
-- **Global state:** `Constants.QsrGiftCard/QsrGiftPin/TsrGiftCard/TsrGiftPin/giftCardBalance`, top-level `var enteredPassword`, and `SharedDataRepository.giftCardAllCardsList/giftCardList/giftCardSettings` (cleared in several places).
-- **Receipts:** four near-identical `printGiftCardReceipt` copies (`PayByCard/Cash/Tender/GiftCardFragment`). All filter to `INVENTORY` cards, so **reloaded cards would be missing from receipts**. The receipt prints the full card number (card footer masked) and no PIN. **No reload, merge or transfer receipt exists.** The Cash variant lacks the empty-printer check.
-- **Delivery is backend-side:** the POS calls a receipt endpoint (`/api/payment/gift-card/receipt/{paymentId}`) with an email or mobile number. Whether it can deliver a card to a **recipient** (not the purchaser) with a personal message is not visible from the client.
-- **Validators:** email regex is copied in three places; phone validators are US-only (two different ones). **No message length-limit utility exists**; error patterns differ between CFD (toast or inline) and POS (snackbar).
-- **Permissions:** `AuthEnum.GIFT_CARDS_VISIBLE` is defined but **unused**; `navGiftCard()` has no permission check.
+### 2.6 Reliability & Stability
 
-### 2.6 Performance & Memory
+- **Failure handling:** none of the existing status APIs handle offline. The HTTP client retries only on connectivity or 502/503.
+- **Failure of a Kitchen Hub call must be visible.** A source shown as "Paused" when the call failed (or the reverse) is the worst outcome: lost orders or orders during an outage.
+- **Secrets/logging:** the POS holds no Kitchen Hub keys. `logNewRelicEvent` is widely used with payload maps, so do not log tokens or `integrationAccountId` unnecessarily and do not dump `RestaurantBO` (it holds `metaAccessToken`).
 
-- The CFD UI state carries ViewModels, `LifecycleOwner` and `Context` for gift card approval screens (leak risk), a pattern the new forms should avoid by passing plain data.
-- Design gallery needs image loading and caching (Glide 4.16 is available). No gallery exists. Design count, image size and caching are unknown.
-- No other notable performance concerns. All operations are online API calls.
+### 2.7 Test Coverage
 
-### 2.7 Reliability & Stability
-
-- **All gift card operations are online-only** (no offline checks); failures show snackbars.
-- **PCI/PII in logs.** `logNewRelicEvent` has no masking. Confirmed in the code:
-  - The **gift card PIN** is logged (`TsrTicketViewModel.kt:2051` `GIFT_CARD_PIN`; `RegisterActivity.kt:1591, 1607, 1649`).
-  - Full **gift card numbers** are logged (`TransferGiftCardDialog`, `GiftCardScannedFragment`, `GiftCardBillFragment`).
-  - Customer **email, phone and name** are logged (`PayByGiftCardFragment.kt:3405–3478`), plus a receipt body with email/phone (`MainViewModel`) and `card: $card` (`AioPrinterViewModel.kt:1033`).
-  - The new flows add recipient name, email, phone and personal message, and migration adds a **new PIN**. They must not be logged.
-- **Cancel flow:** the Digital Purchase CR says Cancel at any step creates no card and no charge. No gift card ticket may be created before payment succeeds (or it must be deleted on cancel; `DELETE /api/gift-card/ticket/{id}` exists).
-- **Fulfilment failure:** payment succeeds but the E-card call fails. There is no existing pattern for "paid but card not loaded".
-
-### 2.8 Test Coverage
-
-- **No gift card tests** anywhere (no discount math, payment flows, ViewModels, CFD, validators or receipts). The repo has about 12 test files in total.
+- No tests for Orders Hub, online ordering, permissions or `BusinessIdUseCase`. Only 4 unit test files exist (`TicketMappersTest`, `ApiQueueRetryLimitTest`, `MenuRefreshPocTest`, `ExampleUnitTest`). MockK and JUnit are available.
 
 ---
 
@@ -124,24 +99,19 @@ Paths under `pos/src/main/java/aio/app/pos/` unless stated. `G/` = `ui/giftcard/
 
 | # | Category | Issue | Severity | Risk Impact |
 | --- | --- | --- | --- | --- |
-| I-1 | Backend contract | No E-card, digital purchase, reload, merge or migration API on the client. Delivery of a card to a recipient (with message) is undefined | **Critical** | Blocks all four CRs |
-| I-2 | Security / PCI | PIN, full card numbers, email, phone and name are logged to New Relic; new flows add more PII and a new PIN | **Critical** | Sensitive data exposure; must not grow |
-| I-3 | Architecture | List, bill and receipts are hard-wired to `INVENTORY` cards (six places) | High | Reload and merge cannot work; reloaded cards missing from receipts |
-| I-4 | Fulfilment | Payment can succeed while E-card load/delivery fails; no recovery pattern | High | Customer pays, gets no card |
-| I-5 | Money | Merge and migration move balance between cards; no idempotency key, no in-flight guard, no rollback | High | Duplicate or partial transfer |
-| I-6 | Architecture | No CFD multi-step form for gift cards; CFD user actions are dropped without a collector; CFD is optional with no fallback | High | Purchase/migration flow can stall or lose input |
-| I-7 | Concurrency | `giftCardValidateResponse` has four collectors and replay 0; a merge scanner would double-add cards; a late collector misses the current-ticket response | High | Wrong cards added; "Ticket ID not found" |
-| I-8 | Business rule | Commission split is not found in code; gift card card payment hard-codes fee 0 | High | Reload commission rule unmet |
-| I-9 | Data | Request DTO has no recipient/delivery/message/sender fields; `replaceCard` drops source and card id after transfer | High | Data lost or cannot be sent |
-| I-10 | Business rule | Transfer is blocked for `DIGITAL` and requires an `INVENTORY` target; merge rules (physical + digital, parent choice) are undefined | High | Migration and merge rules conflict with today's rules |
-| I-11 | UI | No design/template gallery, category list or image loading | Medium | Whole screen is new work |
-| I-12 | UI | No validation framework: email regex copied 3 times, US-only phone checks, no length-limit utility | Medium | Inconsistent validation |
-| I-13 | Architecture | Settings (min/max/presets) fetched only in `RegisterActivity`; dialog skips validation if missing; whole-number-only amounts | Medium | Invalid amounts or wrong presets |
-| I-14 | Architecture | God classes, global state (`Constants.*GiftCard/Pin`) and duplicated code: 4 copies of receipt printing, discount math in 3 places, `isFromGiftCard` in 106 places | Medium | Every change touches many files |
-| I-15 | Permissions | `GIFT_CARDS_VISIBLE` unused; no role gating for new actions | Medium | No way to restrict merge/migration/reload by role |
-| I-16 | Reporting | Reports are server-side; POS only sends `orderType="gift-card"` for card payments (cash/tender/gift card send none) | Medium | Reload may be missing from Sales Summary, Gift Card, Checkout and Z reports |
-| I-17 | UX | PRD says "Switch to CFD"; code says "Switch to guest"; SMS button commented out on the CFD receipt | Low | Naming and capability mismatch |
-| I-18 | Test | No gift card tests | Medium | Regression risk on money code |
+| I-1 | Backend contract | POS has no Kitchen Hub client. Backend endpoints for status read/set, pause enforcement for AIO sources, auto-resume, and per-source state do not exist on the client | **Critical** | Blocks the feature |
+| I-2 | Reliability | Save is non-atomic across providers; Kitchen Hub status can be `unknown`; failure handling undefined | High | UI shows a state that is not real; orders lost or received during a pause |
+| I-3 | Concurrency | No settings-sync event; cache refreshes only at splash/clock-in; no concurrency token | High | Devices disagree; last write wins |
+| I-4 | Data | No server-side auto-resume contract; device has no scheduler for it | High | Source stays paused after the time passes |
+| I-5 | Data | Time handling is device-local; no midnight rollover; restaurant time zone unused; no drift handling | High | Wrong "paused until" time |
+| I-6 | Architecture | Existing online-ordering toggle and new Online Ordering card overlap; Super Admin flag and `enableOnlineOrdering` relationship undefined | High | Two switches controlling one thing |
+| I-7 | UI | Existing toggle updates UI before the API call and never reverts on failure | Medium | Wrong state shown |
+| I-8 | Permissions | No Kitchen Control permission key; role names in the PRD do not match `RolesEnum`; no read-only pattern | Medium | Wrong people can change settings, or nobody can |
+| I-9 | Data | `integrationAccountId` / `partnerName` mapping unknown (SDK data is not consumed by the POS) | Medium | Wrong provider paused |
+| I-10 | Data | Catering and Kiosk "enabled" settings are not read by the POS | Medium | Cards shown for features that are off |
+| I-11 | UI | No time-of-day picker (hour/min/AM-PM) exists | Low | New component |
+| I-12 | Architecture | Source naming inconsistent (`grubhub` vs `grub-hub`); `isThirdPartyOrder()` copied 5 times | Low | Mismatched filters/badges |
+| I-13 | Test | No tests on Orders Hub or settings | Medium | Regression risk |
 
 ---
 
@@ -149,52 +119,45 @@ Paths under `pos/src/main/java/aio/app/pos/` unless stated. `G/` = `ui/giftcard/
 
 | Issue | Fix now? | Justification | Backlog Ticket | Target Sprint |
 | --- | --- | --- | --- | --- |
-| I-1 Backend contract | **Y (first)** | Everything depends on it. One contract review for all four CRs | *[Ref]* | *[Sprint]* |
-| I-2 Sensitive logging | **Y (first)** | Governance: security risk → must fix before new PII flows. Remove PIN, card number, email, phone and name from logs; mask card numbers | — | *[Sprint]* |
-| I-3 `INVENTORY` hard-wiring | **Y** | Required by Reload and Merge. Introduce one rule per card source (what a source may do: reload, transfer, merge) and use it everywhere | — | *[Sprint]* |
-| I-4 Paid but not loaded | **Y** | Show a clear failure state, allow retry of the E-card call without recharging, and log the event. Needs backend retry behavior | *[Ref]* | *[Sprint]* |
-| I-5 Idempotency for merge/migration | **Y** | Idempotency key (backend), in-flight guard, disable buttons while running, refresh card state after timeout | — | *[Sprint]* |
-| I-6 CFD forms | **Y** | Build one reusable CFD gift card form (name, delivery, message) for purchase and migration; add a "no CFD / skip" path to the POS screen | — | *[Sprint]* |
-| I-7 Shared flow | **Y** | Give merge and the new dialogs their own ViewModel/flow; fix the current-ticket race by replaying or reading state on collect | — | *[Sprint]* |
-| I-8 Commission | **Y (needs product + backend)** | Define where the split applies; the POS must pass it in the payment request | *[Ref]* | *[Sprint]* |
-| I-9 DTO fields | **Y** | Extend the ticket request with recipient, delivery and message; keep source and card id in `replaceCard` | — | *[Sprint]* |
-| I-10 Transfer/merge rules | **Y** | Replace the "INVENTORY target only" rule with the new rules once the product answers (see §7) | — | *[Sprint]* |
-| I-11 Design gallery | **Y** | New screen with category filter, Glide cache; reuse nothing | — | *[Sprint]* |
-| I-12 Validation | **Y (scoped)** | One shared email, phone and length validator used by the new forms; do not rewrite existing screens | *[Ref]* | *[Sprint]* |
-| I-13 Settings fetch | **Y** | Fetch settings when the gift card screen opens; block amount entry until loaded; allow decimals if the PRD requires custom amounts with cents | — | *[Sprint]* |
-| I-14 Refactor | **N** | Too large for this iteration. Extract only a shared receipt builder for gift cards (one function instead of four) | *[Ref]* | *[Sprint]* |
-| I-15 Permissions | **Y** | New `AuthEnum` entries for purchase digital, merge, migrate, reload; apply to buttons | *[Ref]* | *[Sprint]* |
-| I-16 Reports | **Y (needs backend)** | Send an explicit gift card type and reload flag for every tender, not only card | *[Ref]* | *[Sprint]* |
-| I-17 Naming / SMS | **Y** | Align labels with design; confirm whether SMS must work on the CFD | — | *[Sprint]* |
-| I-18 Tests | **Y (scoped)** | Unit tests for source rules, amount validation, discount math, merge total, and form validation | *[Ref]* | *[Sprint]* |
+| I-1 Backend contract | **Y (first)** | One agreed API: read all sources' state, set per source (pause until / indefinite / resume). Backend calls Kitchen Hub | *[Ref]* | *[Sprint]* |
+| I-2 Partial failure | **Y** | Per-source result in the response; Save applies only after success; clear error per source; `unknown` shown as "Status unknown" | — | *[Sprint]* |
+| I-3 Multi-device sync | **Y (scoped)** | Fresh GET on every modal open and on Orders Hub resume. New MQTT event is optional and needs backend | *[Ref]* (push sync) | *[Sprint]* |
+| I-4 Auto-resume | **Y (backend)** | Backend owns resume; POS only displays. Refresh badges on resume/poll | *[Ref]* | *[Sprint]* |
+| I-5 Time handling | **Y** | Send an absolute UTC time or a duration computed by the server; show times in the restaurant time zone; handle midnight rollover; pure-function tests | — | *[Sprint]* |
+| I-6 Online ordering overlap | **Y (needs product)** | Define one source of truth. Reuse `enableOnlineOrdering` or replace it; remove the old button if the new card replaces it | *[Ref]* | *[Sprint]* |
+| I-7 Optimistic toggle bug | **Y** | Do not copy it. Fix the old toggle only if it is replaced | *[Ref]* | *[Sprint]* |
+| I-8 Permission | **Y** | New `AuthEnum` key; backend sends it per role; show badges read-only for others | *[Ref]* | *[Sprint]* |
+| I-9 Provider mapping | **Y** | Backend returns the provider list with names and ids; POS does not hard-code | — | *[Sprint]* |
+| I-10 Catering/Kiosk visibility | **Y (needs backend)** | Backend returns which sources exist for the restaurant | — | *[Sprint]* |
+| I-11 Time picker | **Y** | New small component in 15-minute steps, reusable | — | *[Sprint]* |
+| I-12 Naming | **Y (scoped)** | Use `OrderHubSourceEnum` in new code only | *[Ref]* | *[Sprint]* |
+| I-13 Tests | **Y (scoped)** | Unit tests for time calculation, mutual exclusivity (time vs indefinite), card visibility rules, Save/Cancel state | *[Ref]* | *[Sprint]* |
 
-**Governance:** Security and money issues are fixed in this iteration and before the new flows ship. Architectural exceptions need explicit approval. Nothing is ignored without a ticket.
+**Governance:** Everything on the pause path that can silently show a wrong state is fixed in this iteration. New code goes in new files, not in the large Orders Hub classes. Nothing is ignored without a ticket.
 
 ---
 
 ## 5. Impact Assessment
 
 ### 5.1 UI Impact
-- **Landing screen:** two new buttons (Purchase Digital Card, Merge Cards).
-- **Digital purchase:** 7 POS screens (amount/design, custom amount, recipient ×2, delivery, review) + 3 CFD screens (name/recipient, delivery, message) + payment + confirmation.
-- **Merge:** pop-up with parent radio, remove button, "Total merge balance", Merge CTA, success toast.
-- **Migration:** transfer pop-up gets a Digital/Physical chooser and a name/phone/email form (POS and CFD).
-- **Reload:** reload icon on each non-inventory card row, "Set a reload value" pop-up, editable amount shown on the row, receipt.
-- **Navigation:** new fragments inside the existing gift card nav graph; no change elsewhere.
+- Orders Hub: "Kitchen control" button and status badges (one per paused source) in the top strip.
+- New modal: source cards (Grubhub, DoorDash, Uber Eats, **single Online Ordering card**, Catering, Kiosk), toggle, pause-until picker, indefinite checkbox, Save, Cancel.
+- Online Ordering card hidden when disabled in Super Admin. Catering/Kiosk shown only when enabled.
+- No navigation change.
 
 ### 5.2 API Contract Impact
-- **Yes, large.** New or extended endpoints for digital purchase (design, recipient, delivery, message), reload (existing card top-up and payment type), merge (parent + children, total), migration to digital (name, phone, email), and E-card load. Responses must return the card number and, for migration, the PIN. Idempotency keys needed. Older POS builds ignore the new buttons.
+- **Yes.** New AIO endpoints (get state, set state per source) returning per-source status, pause end time (UTC) and an error per source. The backend calls Kitchen Hub. Older POS builds simply do not show the button.
 
 ### 5.3 Database Impact
-- **None expected.** Gift card tickets are not stored in Room today and the new flows should stay API-driven. No migration.
+- **None.** State is read from the server and not stored locally.
 
 ### 5.4 Performance Impact
-- Design gallery images (cache and size). Otherwise low. All calls are online and short.
+- Low. Up to 3 provider calls on open (through the backend), run in parallel.
 
 ### 5.5 Backward Compatibility
-- **Feature flags recommended** per CR (purchase digital, merge, migration, reload) so each can ship or roll back separately; all behind the existing `isGiftCardEnabled`.
-- Legacy and physical flows must keep working; the transfer-to-physical flow is unchanged.
-- Mixed fleet: older builds show none of the new buttons.
+- Recommended: feature flag per restaurant, plus the new permission key (button hidden when absent).
+- Existing online-ordering toggle stays until the product decides (I-6).
+- Mixed fleet: older builds do not show badges, so staff on those devices will not see a pause.
 
 ---
 
@@ -202,56 +165,37 @@ Paths under `pos/src/main/java/aio/app/pos/` unless stated. `G/` = `ui/giftcard/
 
 | Risk | Probability | Impact | Mitigation |
 | --- | --- | --- | --- |
-| Backend/E-card contract not ready or differs | High | **High** | Agree contract first (I-1); POS starts after |
-| Customer pays but card is not loaded or delivered | Medium | **High** | Retry without recharge; clear failure message; alert on paid-but-unloaded |
-| PIN or PII leaked through logs | High | **High** | Fix before new flows (I-2); review every new log call |
-| Merge or migration applied twice or partially | Medium | High | Idempotency key, in-flight guard, refresh card state after timeout |
-| Wrong cards added through the shared scan flow | Medium | Medium | Dedicated flow for merge (I-7) |
-| CFD form lost or stuck (no collector, no display, dropped action) | Medium | Medium | Replay-safe state; POS fallback and cancel path; timeout decision |
-| Reload missing from receipts or reports | High | Medium | Remove `INVENTORY`-only receipt filter (I-3); send explicit type to Reports (I-16) |
-| Commission split applied wrong | Medium | High | Define the rule, pass it explicitly, test it |
-| Scope growth (4 CRs, 3 CFD flows, gallery) | High | Medium | Ship per CR behind flags; recommended order below |
-
-**Suggested order:** (0) security + shared building blocks (log cleanup, source rules, CFD form, validators), then (1) **Reload** (smallest, existing DTO fields), (2) **Migration to Digital**, (3) **Merge**, (4) **Digital Purchase** (largest, needs gallery + E-card).
+| Backend/Kitchen Hub contract not ready | High | **High** | Agree contract first (I-1) |
+| Source shows "paused" but the provider is live (or reverse) | Medium | **High** | Apply state only after success; fresh GET on open; show `unknown` |
+| Paused source never resumes | Medium | High | Backend-owned auto-resume; badge refresh; alert on pauses older than expected |
+| Wrong "paused until" time (time zone, midnight) | Medium | High | Absolute server time; restaurant time zone; tests |
+| Two devices disagree | High | Medium | Fresh read on open; optional push event |
+| Wrong role changes settings | Low | Medium | New permission key; read-only for others |
+| Two controls for online ordering conflict | High | Medium | One source of truth (I-6) |
+| Partial save across providers | Medium | Medium | Per-source result and retry |
 
 **Rollback strategy**
-- Turn the CR's feature flag off to hide its buttons without an app release.
-- If the POS change has a defect, halt rollout or revert that CR's PR. Balance moves made by the backend (merge, migration, reload) cannot be undone by a client rollback.
+- Turn off the per-restaurant flag or remove the permission key to hide the feature with no app release.
+- A pause already set at a provider is not undone by a client rollback; managers resume from the provider or the backend.
 
 **Monitoring plan**
-- New Relic events per flow: started, payment done, E-card/merge/migration API success or failure, delivery failure, duplicate suppressed (**no card number, PIN or contact details in any event**).
-- Alert on paid gift card tickets without a loaded card, and on merge/migration requests without a completion.
+- New Relic events: modal opened, save started/succeeded/failed per source, pause set (source, until/indefinite), resume (manual/auto), status `unknown` (**no keys or integration ids in events**).
+- Alert on sources paused indefinitely for more than a set time and on save failures.
 
 ---
 
 ## 7. Open Questions (blocking)
 
-**Shared**
-1. **Backend/E-card:** which endpoints and payloads for digital purchase, reload, merge and migration? Is delivery (email/SMS, message) done by the backend after payment? What if the E-card call fails after payment?
-2. **Permissions:** which roles may purchase digital, merge, migrate, reload? Is manager approval needed for merge and migration?
-3. **CFD:** is the CFD required or optional for the digital flows? What happens on a single-screen device or when the customer does not respond (timeout, cancel)? The PRD says "Switch to CFD"; existing UI says "Switch to guest".
-4. **Offline:** all gift card operations are online-only today. Confirm that stays true.
-
-**Digital purchase**
-5. Where do designs and categories come from (API, count, images)? What are the custom amount min and max and decimal rules? What is the personal message limit?
-6. Is text (SMS) delivery supported by the backend? The CFD SMS button is currently commented out.
-7. Is a gift card allowed as the tender for a digital purchase? (Allowed today for physical.)
-8. Can a digital purchase be added to an open ticket ("the selected amount is reflected in the ticket total")? Gift card tickets are separate from normal tickets today.
-
-**Reload**
-9. The card must be **active**? Which card sources can be reloaded (physical, digital, migrated)? Digital cards are entered manually only: confirm.
-10. Commission split: where is it configured, and does it apply to every card payment or only to reload?
-11. Does the gift card purchase discount apply to reload amounts (PRD says yes)? Is approval needed for the discount?
-12. Receipt: one receipt for the whole bill, with reload lines marked "Reload"?
-
-**Migration**
-13. Is the new digital card created from inventory, or generated by E-card? Is the old card deactivated? Is the PIN shown on the POS or only emailed?
-14. Phone is optional or required? Is the transferred amount always the full balance?
-
-**Merge**
-15. Which sources can merge into which? Can a digital card be a child? What happens to the child cards (zeroed, deactivated)? Is there a max card count?
-16. What does "the merge event is consumed by the marketing module" mean for the POS: does the backend emit it, or must the POS send an event?
-17. The PRD uses both "Merge" and "Transfer" for the CTA ("Transfer button is enabled"): confirm the label.
+1. **Backend:** Which endpoints? Does the backend proxy Kitchen Hub (the POS has no client or key)? What does a per-source result look like on partial failure?
+2. **AIO sources:** How does the backend enforce a pause for Online Ordering, Catering and Kiosk (reject at checkout, hide ordering)? Does the Kiosk app read this state?
+3. **Online ordering overlap:** What is the relationship between the existing Online Orders On/Off button (`enableOnlineOrdering`), the Super Admin flag, and the new card? Is the old button removed?
+4. **Auto-resume:** Is it fully server-side for both Kitchen Hub and AIO sources? How does the POS learn the source resumed (poll, push, refresh on open)?
+5. **Time:** Which time zone for "Paused until" (restaurant or device)? How are times past midnight handled? Is the maximum pause length limited?
+6. **Roles:** Which roles can edit? The PRD mentions Manager/Admin and Shift Lead, but the matrix lists Manager and Owner. Existing role keys are `manager`, `owner` and `shift-or-assistant-manager`. Is manager approval (PIN) required?
+7. **Visibility:** Are Catering and Kiosk shown only when enabled for the restaurant? Where does that setting come from?
+8. **Unknown status:** What should the UI show when Kitchen Hub returns `unknown`?
+9. **Badges:** Where exactly do badges go (Orders Hub only, or the global header)? Do they also show when a source is disabled in Kitchen Hub directly?
+10. **Deferred items:** The auto-fire and additional-prep-time stories are marked out of scope: confirm they are not part of this release and whether the modal reserves space for them.
 
 ---
 
