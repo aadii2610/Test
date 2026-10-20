@@ -1,8 +1,8 @@
-# Tech Analysis — Kiosk Pay at Counter Orders (POS Consumption)
+# Tech Analysis — Gift Card Visibility and Refund (POS)
 
-**PRD:** [Kiosk Pay at Counter Orders. POS Consumption](https://app.notion.com/p/aio-app/Kiosk-Pay-at-Counter-Orders-POS-Consumption-3b35b13baaa3807597e3c1d7b69cb2b6)
-**Related:** [CR: Send to Kitchen Post Payment](https://app.notion.com/p/aio-app/CR-Send-to-Kitchen-Post-Payment-3b25b13baaa38013a4fdecf2f73afb36) (KDS toggle), `SEND_TO_KITCHEN_POST_PAYMENT_TECH_ANALYSIS.md`
-**Scope of this doc:** POS (Android) only. Kiosk app, WebDash and Backend work is listed as dependencies.
+**PRD:** [Gift Card Visibility and Refund](https://app.notion.com/p/aio-app/Gift-Card-Visibility-and-Refund-3b55b13baaa38021810cec88bc720544)
+**Figma:** [POS Payments](https://www.figma.com/design/UOxJw6F6BPq7rIZU13qy0Q/POS-Payments?node-id=15385-80275)
+**Scope of this doc:** POS (Android) only. MOM app, Backend, Reports, Online Ordering and Gift Cards ledger work is listed as dependencies.
 **Status:** Pre-implementation analysis. No code changed.
 
 ---
@@ -12,36 +12,36 @@
 | Field | Value |
 | --- | --- |
 | **Jira Ticket** | *(pending)* |
-| **Feature Name** | Kiosk Pay at Counter Orders: POS Consumption |
-| **Module / Layer Affected** | **Cross-module.** UI (register, Orders Hub, smart panel), Domain/Data (MQTT ingestion, ticket rules, queue), external SDK (`restaurant`), Kiosk app, WebDash, Backend. |
+| **Feature Name** | Gift Card Visibility and Refund |
+| **Module / Layer Affected** | **Cross-module.** UI (Orders Hub, ticket pane, refund flow), Domain/Data (new gift card ticket model, refund API), Backend, MOM app, Reports, Receipts. |
 | **Tech Lead / Owner** | *(pending)* |
-| **Estimated Complexity** | **L4**. 12 objectives across 5 POS surfaces, with no backend contract or kiosk event confirmed. |
-| **Initial Risk Level** | **High**. Unpaid kiosk orders can be lost (auto-discard), sent twice, or voided incorrectly. |
-| **Dependencies** | **Backend:** kiosk MQTT event, unpaid kiosk status, item status, auto-void, "Kiosk" attribution, no-trace delete, email field. **WebDash:** "Pay at counter" setting. **SDK:** `restaurant` library (new flag). **Kiosk app:** Cash → Pay at Counter flow. **Internal:** KDS post-payment CR. |
+| **Estimated Complexity** | **L4**. The client has no gift card ticket in Orders Hub, no gift card refund API, and most required fields are missing from the DTOs. |
+| **Initial Risk Level** | **High**. Money movement (refund + balance zeroing) across two apps with no idempotency key today. |
+| **Dependencies** | **Backend (critical):** gift card ticket in the orders list/search, card state fields, refund endpoint, atomic refund + deactivate, refund lock. **MOM app**, **Reports**, **Receipts**, **Online Ordering**. **Internal:** refund flow, `AllowedFeature` permissions. |
 | **Target Release Date** | *(pending)* |
 
 ### Business Context
 
-- **Problem:** An unpaid kiosk order has no landing surface, no alert and no consistent kitchen-firing rule on the POS.
-- **User impact:** The cashier sees the order the moment it lands, with full item detail, edits it, takes payment (full or partial) and the kitchen fires per a setting.
-- **Success criteria:** Every Pay at Counter order appears on the POS with an alert, is never lost or duplicated, and fires to KDS exactly once per the toggle.
+- **Problem:** A gift card sale has no guaranteed searchable ticket, and nothing stops a used card from being refunded. Risks are double liability (guest refunded, card still spendable) and unreconciled reports.
+- **User impact:** Staff find a gift card purchase in Orders Hub, and refund it with guardrails, from POS or MOM.
+- **Success criteria:** No refund of a used card, no double refund across POS/MOM, a refunded card is zeroed and deactivated in the same action, and Reports show the refund in the same period.
 
 ### PRD scope → what exists today (summary)
 
 | PRD item | Today in POS | Gap |
 | --- | --- | --- |
-| Ticket lands on New Ticket screen + Orders Hub | A kiosk ticket is `orderSource == "kiosk"` (`OrderHubSourceEnum.KIOSK`). Kiosk is treated as **already paid** everywhere. | "Pay at counter" / unpaid kiosk does not exist anywhere in code |
-| Dedicated Kiosk queue / "Pending" tab | A Pending status tab exists but is **3rd Party only** (`OrdersHubTicketsFragment.setVisibilityHeader` ~L1574) | New tab rule, query and gating |
-| Smart panel alert + sound, 15-min expiry, oldest first | `OrderOut` list is 3PO-only (Accept/Reject UI), newest first, in-memory, no fixed timeout | New block type, sort, expiry, persistence |
-| Edit rules (items not editable, deletable, add new) | No item-level lock; only status-based locks | New kiosk-origin rule at 4 sites |
-| Order type change + table tent | Both exist. Table tent icon is **not tied to dine-in**. | Prompt/gate on Takeaway → Dine In |
-| Change guest (not with loyalty/deal) | No "remove loyalty first" check. Changing the guest **silently deletes loyalty items**. | New pre-check |
-| Tax exemption + audit | Kebab checkbox only. No reason, no employee captured. | Reason, employee, backend field |
-| Void / Delete pending ticket | No void or delete in Orders Hub. Delete allowed only for `pos`/`mPos`. | New action, source allow-list, no-trace delete |
-| Auto-void at clock-out | Clock-out cleans only the employee's empty/pending tickets for `pos`/`mPos` | Location-wide unpaid kiosk void |
-| No server, attribute to "Kiosk" | Null employee renders `--`. "Kiosk" source for sales/tips is not implemented. | Attribution (mostly backend) |
-| Remove tip prompt on kiosk; email to POS | No ticket-level email field | Backend + model field |
-| KDS toggle | Not implemented (see KDS CR) | Dependency |
+| Search gift card tickets in Orders Hub (order no., guest, card no.) | **Gift card tickets are not in Orders Hub.** They are backend objects (`POST /api/gift-card/ticket`), not in Room. Search is local and does not search card numbers. | New data source, new search field |
+| Order source (POS/Online) and order type (Digital Gift Card) | Not found. Only `orderType = "gift-card"` is sent for card-paid purchases. | New fields and enums |
+| "Refund Gift Card" action on ticket detail | **No gift card refund code.** `GiftCardActivity.onRefundClicked` has no callers. Ticket detail buttons fall back to "no buttons" for unknown types. | New action, new flow |
+| Eligibility (unused card / same day / not legacy) | Not found: original balance, issue date, legacy flag, deactivated state | Backend fields needed |
+| Per-card and per-reload refund; Partially Refunded / Refunded | Refund is amount-component based (subtotal, tax, tip…). Per-line refund is not supported. No distinct "Partially Refunded" badge. | New per-card flow |
+| Mandatory reason | A reason exists but a default is pre-selected ("Bad food quality") and the list is food-oriented | Change reason UX for gift cards |
+| Reuse original tender | Implicit: card goes to one API, everything else to another. No auto-match. | Needs a rule + server confirmation |
+| Digital refund receipt to purchaser | Email receipt exists, address typed by hand. Purchaser email is in the model but unused. | Prefill + gift card receipt |
+| Zero + deactivate; reloadable / blocked | Not found | Backend |
+| Lock across POS/MOM | Not found. Client uses a cached ticket snapshot and no idempotency key. | Server lock + refresh |
+| New permission "Refund Gift Card" | `AllowedFeature` model exists; no gift card refund entry | New `AuthEnum` + server feature |
+| Reports | Server-side only | Backend |
 
 ---
 
@@ -51,58 +51,61 @@ Paths under `pos/src/main/java/aio/app/pos/` unless stated.
 
 ### 2.1 Architecture & Layering
 
-- **How tickets from other devices arrive:** `ApplicationRepositoryImpl.observeMQTT` (L683) → sequence validation → `dispatchMessage` (L958; `CREATE_TICKET` L1187) or `posOtherThanTicketFlowDispatchMessage` (L1474; 3PO, QR, online) → `UpdateTicketRepositoryImpl` writes to Room.
-  - **Which MQTT event a kiosk ticket would use is not visible in code.** Comments mention "Online Website And Kiosk No Payment Event". The kiosk-settings MQTT event is commented out.
-  - **A new event type must be added in three places:** `dispatchMessage`, `posOtherThanTicketFlowDispatchMessage`, and `TicketSequenceRepositoryImpl.handleSequenceMismatch` (reconcile).
-  - MQTT messages older than **10 minutes are dropped** (`isOlderThanTenMinutes`). A POS offline longer than that relies on reconcile/fallback sync.
-- **No auto-open of incoming tickets.** `MqttEvent` has no "ticket received" variant. The register builds its current ticket by selection or creation only.
-- **Smart panel:** the alert block is the `OrderOut` list in `SmartPanelRepositoryImpl` (L55–110), fed only by `addOrderOutItem` from `handleThirdPartyOrderReceived`. Its UI (`order_out_item.xml`) is 3PO-specific (Reject / Accept & Fire). The panel is hosted in `RegisterActivity` (`SmartPanelFragment`) and in Orders Hub through `AioIntelligenceOrderHubSettings`.
-- **Orders Hub reads Room with one-shot queries**, refreshed on `onResume`, after fallback sync and after fire/cancel. **It is not reactive**, so a kiosk ticket arriving while Orders Hub is open will not appear until one of those triggers fires.
-- **The PRD's "All orders dropdown" does not exist in code.** Orders Hub has two tab rows (type tabs, status tabs). The "Pending" tab maps to the status row.
-- **Settings:** `aioRestaurant.appState` (external SDK `restaurant:0.0.32`) via `BusinessIdUseCase`. No "pay at counter" flag exists, so a new boolean needs an SDK release and a version bump in `pos/build.gradle`. There is no MQTT settings push, so a changed toggle reaches the POS on the next refresh.
-- **Large classes on the change path:** `UpdateTicketRepositoryImpl` 3,628 lines, `ApplicationRepositoryImpl` 2,497, `OrdersHubParentActivity` 2,961, `OrdersHubTicketsFragment` 1,620, `TicketFragment` 4,669 (39 `IS_QUICK_SERVE` branches), `RegisterActivity` 4,938.
+- **Gift card sale is a separate flow, not a normal ticket.** `GiftCardActivity` (2,749 lines) → `GiftCardBillFragment` → payment through `PaymentParentFragment.handleGiftCardTicket` (L347) with `isFromGiftCard` / `giftCardTicketId` bundle args. The ticket is created via `POST /api/gift-card/ticket` and paid via `POST /api/payment/process-payment` (`type = "giftCardTicket"`). `PaymentParentFragment` notes it is "not stored in DB".
+- **Orders Hub reads only Room `ticket_request_table`**, which has no gift card fields. `OrderHubTypesEnum` and `OrderHubSourceEnum` have no gift card or digital values. There is no "gift" string under `orderhub`.
+- **Ticket detail actions** come from `TicketUtils.getStatusTypes` (~L140–245). Any type that is not third-party/delivery/takeout/dine-in falls to `else -> VOIDED` (L238, L242) and **shows no buttons**, so a gift card type needs an explicit branch.
+- **Refund flow already exists** as six fragments under `ui/main/fragments/refund/`: `PaymentSelectionFragment` → `RefundAmountSelectionFragment` → `RefundReasonFragment` → `RefundConfirmationFragment` → `RefundCompleteFragment`, driven by `PaymentParentFragment.startRefundFlow` (L680–717). The repo document `REFUND_MAIN_FRAGMENT_NAVGRAPH_MIGRATION_SOLUTION.md` is **stale** (`RefundMainFragment` no longer exists).
+- **Refund state** is plain `var`s in `RefundRepository` (Koin `single`), with no thread safety. The ticket is cached there when the flow starts.
+- **Permissions:** `AllowedFeature` (Room) read via `loadAllowedFeatureByRoleAndFeatureName(roleId, AuthEnum.X.feature)`. `AuthEnum.REFUND_VISIBLE` exists; `GIFT_CARDS_VISIBLE` is defined but **never used**. Gift cards are gated only by `isGiftCardEnabled`. Manager PIN (`approve-with-pin`) sends only `restaurantId` and `pin`, with no feature name.
+- **Duplication / size:** `PayByGiftCardFragment` 3,538 lines (builds the same purchase request in two places), `TsrTicketViewModel` 2,244 lines with ~10 gift card `SharedFlow`s, `RegisterActivity` 4,938, `OrdersHubParentActivity` 2,961. `BackendPaymentEnum` and `OrderHubPaymentEnum` are near-duplicates with different strings (`"refund"` vs `"full-refund"`).
 
 ### 2.2 Concurrency
 
-- MQTT collection runs on IO. `OrderOut` uses a synchronized list plus StateFlow and a **1-second global polling loop** (`orderOutUpdateJob`, L303) that removes items only when `autoFire && remaining == 0`. There is no 15-minute expiry.
-- **Sound:** `RingtoneRepositoryImp` wraps a single `MediaPlayer`; each `play()` releases the previous one, so **back-to-back alerts cut each other off**. Not a leak.
-- **Unknown:** most QSR click handlers mix `lifecycleScope` Main/IO and use unbounded `firstOrNull` waits on `ticketApiState`. Queued tasks need a remote ticket id (`QSR_REMOTE_CREATE_REQUIRED_TASK_TYPES`).
+- Refund is **online-only**, a direct API call with a 150 s timeout, no queue, no retry (`ApiService.kt:201–207`).
+- **No in-flight guard** in the ViewModel. Protection is only hiding the confirm button and `setSafeOnClickListener`.
+- **No idempotency key** in `RefundRequest` or `CashRefundPost`. On timeout the UI reverts after 3 s and the user can retry.
+- **If the app is backgrounded**, `RefundSuccess` (SharedFlow, no replay, `repeatOnLifecycle(STARTED)`) can be lost and the UI stays on "processing".
+- Orders Hub search loads and maps **all tickets on every keystroke** with no debounce (`OrdersHubSearchRepoImpl.kt:50–84`).
 
 ### 2.3 Data Layer
 
-- **No guest-email field on the ticket.** Only `customerName`, `phoneNumber`, and `customer.emailAddress` on the customer object.
-- **Kiosk ticket payment state:** the calculator treats KIOSK as non-online. Unpaid recalculates locally; Partial on kiosk uses the **cached server value** (`CalculationsFromPaymentInfo.kt:35`), which may be wrong after a partial payment on an editable ticket.
-- **Orders Hub kiosk pane is forced to "goToPayment-print"** (`TicketUtils.kt:298`), so an unpaid kiosk ticket loses "Go to Order" (`GoToOrderScreen.kt:109`).
-- **Void is queued offline-first** (`VOID_ORDER`, payload `reason` + `status` only, no employee id). A partially paid ticket **cannot be voided** (toast "Cannot void partially paid or unclosed tickets") and refunds are a separate API. The PRD (US11) expects void with automatic refund/reconcile.
-- **"No-trace delete"** exists only as discard of empty/all-pending tickets, allowed only for `pos` and `mPos` (`TicketViewModel.kt:648`). Whether the backend leaves a report trace is not visible from the client. Note: `OrderSourceEnum.MPOS = "mPos"` vs `OrderHubSourceEnum.MPOS = "mpos"` (casing mismatch).
-- **Fallback sync wipes and reinserts Room**, and does not notify Orders Hub (comment at `OrdersHubParentActivity.kt:611`).
+- **Present on the client:** `GiftCardValidateDataDTO` (id, cardNumber, amount, status, source, balance), `GiftCardSource` (inventory, migrated, physical, digital; `migrated` is the only plausible legacy marker), `GiftCardTicketItemRequestDTO(cardNumber, topupAmountInCents, giftCardId)`, `UserGiftCardPayment` (initial_amount, balance, status, recipient_*, purchased_by_*; attached only when a gift card is used as **tender**).
+- **Not found:** issue date, legacy/cutover flag, delivery status, digital boolean, reloadable flag, deactivated state, original issued balance on the card DTO, order source and order type on gift tickets, any refund state or origin, any Room entity for gift cards.
+- **No gift card refund, deactivate, reload-reversal or credit-back endpoint exists.** Gift card endpoints are `ApiService.kt:903–972`. The payment SDK (`aio.app.common:payment-core`, external) was not inspected for refund support.
+- **No standalone reload-sale flow** found on the client (only `inventory` cards enter the bill; existing cards show Transfer only), although DTOs carry `topupAmountInCents` and `existingBalanceInCents`. PRD story "reloads refunded as separate lines" has no matching client model.
+- **Digital sale and recipient email capture** was not found on the POS (`GiftCardSource.DIGITAL` only disables Transfer).
+- **Refund endpoints today:** `POST api/payment/refund` (card only), `POST api/payment/refund/{ticketId}` (everything else, no card number in the payload), `GET api/payment/refund/{ticketId}`. When the original tender is a gift card, the server must credit the card.
+- **Money types:** `Double` in DTOs, `String` in `RefundMetaData`; amounts are `roundToInt` of grand total × 100 (`RefundConfirmationViewModel.kt:221`). Calculator uses BigDecimal HALF_UP.
+- `MqttTicketMapper.kt:293–294`: `refundedserviceChargeAmount` and `refundedGratuityAmount` are commented out, so those fields are dropped for payments arriving via MQTT.
 
 ### 2.4 UI & State Management
 
-- **Item locking:** there is no `isEditable`/`isLocked` flag on `TicketItem` and no source on the item. The only lock is item status (`TicketMultiViewAdapter.kt:90–110`). Edit entry points: `QsrMenuFragment.whenTicketItemClickToEdit` (L2307) and `whenTicketItemMultiSelectToEdit` (L2123), header from `QsrMenuRepoImpl.kt:330–346`. **TSR duplicates this** (`PagerTicketFragment`, `TsrMenuFragment`), so the rule is needed at 4 sites.
-- **Order type:** toggle at `TicketFragment.kt:3141/3154` (blocked when partially paid) → `UPDATE_ORDER_TYPE` → local update, `OrderTypeSwitch`, `updateServiceCharge`. Order-type charges recalculate already (US8 is largely covered).
-- **Table tent:** icon shows whenever `isTableTentEnabled` is on; dialog `TicketFragment.kt:2237`; disabled once a number exists. There is **no dine-in check** and no auto-prompt after switching to Dine In.
-- **Customer:** QSR freezes the name once set (X to clear). `canRemoveTicketCustomer` blocks only when items were sent to KDS. **Clearing or changing the customer deletes all loyalty items without warning** (`TicketViewModel.kt:313`). Deals are not handled.
-- **Tax exemption:** kebab checkbox `menuItemTax` → `UPDATE_TAX_EXEMPTION` (boolean only). Manager approval callback carries no approver id, so audit is New Relic logs only (US10 requires reason + employee).
-- **Payments:** Card/Cash/Other buttons, partial payment supported. After a partial payment, item taps, kebab, order type, customer and tax are all locked. **There is no "payment mode popup" and no zero-total checkout path** (PRD mentions "O dollar checkout will not have payment mode pop up").
-- **Tips:** QSR card tip is chosen on the customer display with a Skip button; QSR cash has no tip in the payment flow. PRD's "capture tipping on POS" needs a product decision on where.
+- **Refund eligibility today:** `onConfirmClicked` blocks a payment already `full-refund`, `partial-refund` or `refund-initiated`. **A partially refunded payment cannot be refunded again.** Full vs partial uses a 0.01 tolerance.
+- **Reason:** 7 fixed radio options plus "Other", and `rBtnOne` ("Bad food quality") is `checked="true"` by default (`fragment_refund_reason.xml:92`), so the reason is **effectively pre-filled, not mandatory**. An empty custom reason is ignored. The PRD requires a mandatory reason.
+- **Status badge:** `OrdersHubTicketAdapter.kt:297–306` shows one "Refund" badge for full and partial. The filter dialog distinguishes them.
+- **Reason and refunding staff** are stored per `Refund` (`reason`, `refundedBy`, `approvedBy`) but shown only in payment-log history and on the printed receipt, **not on the ticket detail** (PRD requires them visible).
+- **`approvedBy` is never populated:** `Constants.APPROVAL_USER_ID` is read in `RefundConfirmationViewModel.kt:214,386` and **no code writes it** (verified across `pos` and `commons`). The approver always equals the refunder.
+- **Gift card lines** render as pseudo `TicketItem`s built from bundle args (card number in `itemDescription`), not from the DB (`TicketItemBillAdapter.kt:115`).
+- **Side effect:** `cashRefund` always logs `CASH_REFUND` and emits `OpenCashDrawer` for **every non-card tender** (gift card, tender, mke, moto), so the drawer opens and a cash drawer entry is sent for a gift-card-tender refund (`RefundConfirmationViewModel.kt:389–396, 471`).
+- **Already-refunded lock:** the refund flow caches the ticket in `RefundRepository.ticketData` when it starts and refreshes only on `DeliveryStatusUpdated`. A refund made on MOM mid-flow is not seen, and the "already refunded" check uses the stale snapshot (`RefundConfirmationViewModel.kt:113`). There is no `REFUND_*` MQTT event; payment changes arrive as `TICKET_PAYMENT_UPDATE` → `handlePaymentEvent`, and gift card tickets are not delivered that way.
+- **Receipts:** printed refund receipt (`TicketReceiptMapper.refundReceipt`) has no gift card, purchaser or card info. Email receipt: `POST /api/payment/receipt/{paymentId}` (`receiptType = "refund"`, `refundId` required; address typed by hand), and a gift card variant `POST /api/payment/gift-card/receipt/{paymentId}`. `Payment.userGiftCardPayment.purchasedByEmail` exists but no refund code uses it.
 
 ### 2.5 Performance & Memory
 
-- `OrderOut` is **in-memory only**, so alerts are lost on process death.
-- The 1-second polling loop runs globally for all items. Acceptable for a few items; must be removed or reworked for a time-based expiry.
-- No new network payloads are expected beyond the new kiosk event.
+- Search-on-keystroke over all tickets is the only notable cost, and it grows if gift card tickets are added to the same list. Add a debounce or move the search to a query.
+- No new heavy payloads expected.
 
 ### 2.6 Reliability & Stability
 
-- **Auto-discard can delete a kiosk ticket.** If kiosk items arrive with status `pending` and the cashier opens the ticket then navigates away, `RegisterActivity.onEmptyTicket` (L1243–1290) and `onDestroy` (L4262–4282) call the discard paths. They are guarded by the `pos`/`mPos` allow-list on the synced-order path (`TicketViewModel.kt:648`), but other paths (MQTT `removeEmptyTicket`, `EmployeeEmptyTicketCleanupUseCase`) need to be checked against the new ticket state. **The kiosk item status is not verifiable from code.**
-- **Clock-out:** `ClockInViewModel.clockOut` (L200) runs `cleanupEmptyTicketsForEmployee` (L202), employee-scoped and local-DB driven, then drains the queue (12 s cap) and makes an **online-only** server call. There is no unpaid-ticket check at clock-out. A manager clocking out another employee goes through a different path (`EmployeeScheduleFragment.kt:253` → `clockOutEmployeeFromDashboard`) and **bypasses the hook**. Multiple devices/employees would queue duplicate voids (the queue is per device).
-- **Void/Delete need approval rules:** PRD US11 asks for a reason + timestamp + original kiosk order number log; today void sends `reason` + `status` only.
-- **Duplicated click handler:** the `rlPending` click listener is registered twice (`OrdersHubTicketsFragment.kt:1012`, `:1038`).
+- **Privacy / security (found while tracing):**
+  - `TsrTicketViewModel.getGiftCardBalance` (~L2050) **logs the gift card number and PIN to New Relic.**
+  - `ClockInViewModel.kt:122` puts the **raw manager PIN** into a New Relic log map.
+- **Idempotency gap** (§2.2) and **stale snapshot** (§2.4) are the two main double-refund risks. Double-refund prevention today is server-side only (the `refund-initiated` state).
+- Gift card tickets are not in Room and not updated by MQTT, so a refund done elsewhere is never reflected locally.
 
 ### 2.7 Test Coverage
 
-- No tests for MQTT sequencing, `UpdateTicketRepositoryImpl`, `SmartPanelRepositoryImpl`, Orders Hub, QSR void/tax/customer/order-type rules, clock-out cleanup, or kiosk handling. Existing tests: `TicketMappersTest`, `ApiQueueRetryLimitTest`, `MenuRefreshPocTest`, `payment_calculator` tests.
+- No tests for gift cards, Orders Hub, or refunds. Existing tests: `TicketMappersTest`, `ApiQueueRetryLimitTest`, `MenuRefreshPocTest`, example tests. `payment_calculator` has no refund tests.
 
 ---
 
@@ -110,25 +113,22 @@ Paths under `pos/src/main/java/aio/app/pos/` unless stated.
 
 | # | Category | Issue | Severity | Risk Impact |
 | --- | --- | --- | --- | --- |
-| I-1 | Backend contract | Kiosk MQTT event, unpaid status, item status and payload (email, "Kiosk" source) are undefined | **Critical** | Blocks the design |
-| I-2 | Data loss | Discard paths may delete a kiosk ticket opened then left on the register (depends on item status) | **Critical** | Unpaid customer order lost |
-| I-3 | Architecture | "Pay at counter" flag needs an SDK release, version bump and settings refresh (no push) | High | Tab/flow gating wrong or delayed |
-| I-4 | Architecture | `OrderOut` and smart panel UI are 3PO-specific; newest-first sort; no 15-min expiry; in-memory only | High | Alert block cannot be reused as-is |
-| I-5 | Reliability | Orders Hub is not reactive; incoming kiosk tickets do not appear until refresh | High | Cashier misses orders (PRD US4, US15) |
-| I-6 | Data | Partial payment on kiosk uses cached server paymentInfo (calculator) | High | Wrong totals after cashier edits |
-| I-7 | Reliability | Auto-void at clock-out: employee-scoped, local-only, online-only, bypassed by manager clock-out, per-device queue | High | Unpaid tickets stay open or are voided twice |
-| I-8 | Business rule | Void blocked for partially paid tickets; no refund in the void flow. PRD US11 expects refund/reconcile | High | Cannot meet US11 |
-| I-9 | Business rule | Changing the guest silently deletes loyalty items; deals unhandled (PRD: must remove first) | High | Silent data loss; PRD rule unmet |
-| I-10 | Business rule | Delete allowed only for `pos`/`mPos`; Orders Hub has no void/delete; "no report trace" not verifiable | High | PRD's delete cannot work |
-| I-11 | Architecture | Item-edit lock rule needed at 4 sites (QSR + TSR duplicates) | Medium | Inconsistent locking |
-| I-12 | Business rule | Tax exemption has no reason/employee; approver id not captured | Medium | Audit requirement unmet |
-| I-13 | UX | Table tent not tied to dine-in; no prompt on Takeaway → Dine In | Medium | PRD flow missing |
-| I-14 | Data | No ticket-level guest-email field | Medium | Email cannot reach POS ticket |
-| I-15 | Reliability | MQTT messages older than 10 min dropped; relies on reconcile | Medium | Late-arriving kiosk order missed |
-| I-16 | Concurrency | Single `MediaPlayer`; back-to-back alerts cut each other off | Low | Missed sound |
-| I-17 | Bug | Duplicate `rlPending` click listener (`OrdersHubTicketsFragment.kt:1012`, `:1038`) | Low | Double handling on tap |
-| I-18 | Bug | `mPos` vs `mpos` casing mismatch in delete allow-list | Low | Silent misses |
-| I-19 | Test | No tests on any affected area | Medium | Regression risk |
+| I-1 | Backend contract | No gift card ticket list/search, refund endpoint, card state fields (original balance, issue date, legacy, deactivated, reloadable), atomic refund + deactivate, or refund lock exists in the client contract | **Critical** | Blocks the design |
+| I-2 | Money | No idempotency key and no in-flight guard on refund; stale cached ticket; refund can be retried after timeout | **Critical** | Double refund |
+| I-3 | Architecture | Gift card tickets are not in Orders Hub/Room; search ignores card numbers; no gift card type/source enums | High | Core PRD story cannot work as-is |
+| I-4 | Architecture | Per-card / per-reload refund does not exist; current refund is amount-component based and one refund per payment | High | PRD multi-card and reload scenarios unsupported |
+| I-5 | Business rule | Reason is pre-selected and not mandatory; the options are food-specific | High | Audit requirement unmet |
+| I-6 | Business rule | `approvedBy` never populated; reason/refunding staff not shown on ticket detail | Medium | Audit fields missing (PRD asks for both) |
+| I-7 | Business rule | Gift-card-tender refunds open the cash drawer and write a cash drawer log | High | Wrong cash records |
+| I-8 | Security | Gift card number + PIN and raw manager PIN logged to New Relic | High | Sensitive data exposure |
+| I-9 | Data | Original tender "reuse" is implicit and server-decided; no auto-match | Medium | Wrong tender possible |
+| I-10 | Permissions | No "Refund Gift Card" permission; `GIFT_CARDS_VISIBLE` unused; manager PIN is not feature-scoped | Medium | Cannot restrict by role |
+| I-11 | Reliability | `RefundSuccess` lost on background; UI stuck on "processing" | Medium | Staff retry and double refund |
+| I-12 | UI | `getStatusTypes` falls to no buttons for unknown types; "Refund" badge for full and partial | Medium | No action on gift card tickets; unclear status |
+| I-13 | Data | Purchaser email unused; email typed by hand; MQTT drops `refundedserviceChargeAmount` / `refundedGratuityAmount` | Low | Receipt friction; missing refund fields |
+| I-14 | Architecture | Duplicate payment enums; gift card purchase request built in two places; stale refund doc | Low | Maintenance |
+| I-15 | Performance | Search over all tickets per keystroke, no debounce | Low | Lag as the list grows |
+| I-16 | Test | No tests on gift cards or refunds | Medium | Regression risk on money code |
 
 ---
 
@@ -136,52 +136,48 @@ Paths under `pos/src/main/java/aio/app/pos/` unless stated.
 
 | Issue | Fix now? | Justification | Backlog Ticket | Target Sprint |
 | --- | --- | --- | --- | --- |
-| I-1 Backend contract | **Y (first)** | Everything depends on it. Agree event, statuses and payload before POS work | *[Ref]* | *[Sprint]* |
-| I-2 Auto-discard | **Y** | Governance: data loss → must fix. Exclude unpaid kiosk tickets from all discard/cleanup paths and add a test | — | *[Sprint]* |
-| I-3 SDK flag | **Y** | Required. Release and verify the flag persists in Room first | *[Ref]* | *[Sprint]* |
-| I-4 Alert block | **Y** | New kiosk card type in the smart panel: oldest first, 15-min expiry from placed time, sound. Reuse the repository, add a kiosk item type | — | *[Sprint]* |
-| I-5 Orders Hub refresh | **Y** | Trigger a refresh when a kiosk ticket is inserted (event or Room Flow for this tab only). Do not rewrite Orders Hub | *[Ref]* (full reactive Orders Hub) | *[Sprint]* |
-| I-6 Cached paymentInfo | **Y (verify)** | Confirm with calculator owner; recalc locally for unpaid/partial pay-at-counter | — | *[Sprint]* |
-| I-7 Clock-out auto-void | **Y (backend-led)** | Recommend server-side auto-void in the clock-out endpoint (reaches all devices, covers manager clock-out). POS only reacts to the MQTT void | *[Ref]* | *[Sprint]* |
-| I-8 Void with partial payment | **Y (needs decision)** | Product/backend must define refund behavior | *[Ref]* | *[Sprint]* |
-| I-9 Guest change rule | **Y** | Add a pre-check; block and tell the user to remove loyalty/deal first | — | *[Sprint]* |
-| I-10 Void/Delete action | **Y** | Add Void and Delete (with confirm popup) to the ticket kebab and the Orders Hub pane for unpaid kiosk tickets. Add `kiosk` to the delete allow-list for this case only | — | *[Sprint]* |
-| I-11 Item lock rule | **Y** | One predicate (`isKioskOrigin`), used at all 4 sites. No QSR/TSR merge | — | *[Sprint]* |
-| I-12 Tax exemption audit | **Y (needs backend)** | Reason dialog + employee fields on the request | *[Ref]* | *[Sprint]* |
-| I-13 Table tent | **Y** | Auto-prompt after Takeaway → Dine In for kiosk tickets, reusing the existing dialog | — | *[Sprint]* |
-| I-14 Email field | **Y (needs backend)** | Add the field to the ticket model/DTO if the backend sends it | — | *[Sprint]* |
-| I-15 10-min drop | **N** | Rely on reconcile. Verify kiosk events carry sequence data | *[Ref]* | *[Sprint]* |
-| I-16 MediaPlayer | **N** | Low impact; log for backlog | *[Ref]* | *[Sprint]* |
-| I-17 Duplicate listener | **Y** | Same file we edit; remove one | — | *[Sprint]* |
-| I-18 `mPos` casing | **Y** | One-line fix, same code we touch | — | *[Sprint]* |
-| I-19 Tests | **Y (scoped)** | Unit tests for the new pure rules: discard exclusion, item lock, guest change, Pending tab query | *[Ref]* (broader coverage) | *[Sprint]* |
+| I-1 Backend contract | **Y (first)** | Everything depends on it. Agree endpoint and fields with Backend/MOM first | *[Ref]* | *[Sprint]* |
+| I-2 Idempotency / double refund | **Y** | Governance: money and data risk → must fix. Add an idempotency key (needs backend), an in-flight guard, and refresh the ticket before submit | — | *[Sprint]* |
+| I-3 Gift card tickets in Orders Hub | **Y** | Required. Either the backend returns them in the orders feed (preferred) or a new gift card orders API; add card-number search | — | *[Sprint]* |
+| I-4 Per-card refund flow | **Y** | New, small flow for gift cards: select card or reload line → reason → confirm. Do not extend the amount-component flow | — | *[Sprint]* |
+| I-5 Mandatory reason | **Y** | Gift card flow: no default selection; a gift-card-appropriate reason list | — | *[Sprint]* |
+| I-6 Audit fields | **Y** | Show reason and refunding staff on ticket detail; populate `approvedBy` for gift card refunds | *[Ref]* (general refund flow) | *[Sprint]* |
+| I-7 Cash drawer on non-cash refund | **Y (gift card path only)** | Do not open the drawer or log cash for gift card refunds. General refund fix goes to backlog | *[Ref]* | *[Sprint]* |
+| I-8 Sensitive logging | **Y** | Remove card number, PIN and manager PIN from logs. Quick, high value | — | *[Sprint]* |
+| I-9 Tender reuse | **Y** | Auto-select the original tender and disallow change. Confirm the server rule | — | *[Sprint]* |
+| I-10 Permission | **Y** | New `AuthEnum` entry; backend sends it in `userFeatureDtos` | *[Ref]* | *[Sprint]* |
+| I-11 Lost `RefundSuccess` | **Y** | Use replay-safe state for the gift card flow | — | *[Sprint]* |
+| I-12 Buttons / badge | **Y** | Explicit gift card branch in `getStatusTypes`; "Partially Refunded" badge | — | *[Sprint]* |
+| I-13 Receipt / MQTT fields | **Y (receipt only)** | Prefill purchaser email; use the gift card receipt endpoint. MQTT field fix to backlog | *[Ref]* | *[Sprint]* |
+| I-14 Duplicates / stale doc | **N** | Out of scope. Mark the stale doc as outdated | *[Ref]* | *[Sprint]* |
+| I-15 Search debounce | **Y** | Same code we touch; small change | — | *[Sprint]* |
+| I-16 Tests | **Y (scoped)** | Unit tests for eligibility rules (unused / same-day / legacy / already refunded) and ticket-state calculation (partially refunded vs refunded) | *[Ref]* | *[Sprint]* |
 
-**Governance:** Data loss and crash risks are fixed in this iteration. Architectural exceptions need explicit approval. Nothing is ignored without a ticket.
+**Governance:** Money and sensitive-data issues are fixed in this iteration. Architectural exceptions need explicit approval. Nothing is ignored without a ticket.
 
 ---
 
 ## 5. Impact Assessment
 
 ### 5.1 UI Impact
-- **New Ticket screen:** ticket persists after navigating away; locked kiosk items (delete only, add allowed); kebab with Void and Delete; table tent prompt; red-flag abandonment cue (needs design for the threshold).
-- **Orders Hub:** "Pending" tab visible for kiosk orders only when "Pay at counter" is ON; Go to Payment / Go to Order for unpaid kiosk; Void/Delete in the ticket pane.
-- **Smart panel:** new kiosk alert card on register and Orders Hub, with sound; oldest on top; removed after 15 min.
-- **Payment:** no changes to the selector. KDS firing follows the toggle (Save & Send disabled when ON).
-- **Navigation:** no new graph destinations.
+- **Orders Hub:** gift card tickets appear in the list; search by card number; gift card badges (source, type, Refunded / Partially Refunded); refund reason and refunding staff on the detail pane.
+- **Ticket detail:** "Refund Gift Card" action with a visible disabled reason ("card already used", "already refunded"); legacy cards show no action.
+- **New flow:** pick card/reload → reason (mandatory) → confirm → complete (with receipt).
+- **Navigation:** reuse the existing refund child-fragment host; no new graph destination.
 
 ### 5.2 API Contract Impact
-- **Yes.** New kiosk event / ticket payload (unpaid status, item status, email, "Kiosk" source), void and delete behavior for kiosk tickets, tax exemption reason/employee, auto-void at clock-out, and the new setting. Older POS builds must ignore unknown fields.
+- **Yes, large.** Gift card ticket list/detail with card state (original balance, current balance, issue date, legacy, type, deactivated, reloadable, delivery status, order source, order type), a gift card refund endpoint (atomic zero + deactivate + tender reversal, idempotency key, per-card/reload lines), a refund-lock signal, and receipt support. Older POS builds ignore new fields.
 
 ### 5.3 Database Impact
-- New setting column in the SDK `RestaurantEntity` (migration). Possible new ticket fields (email, kiosk flags). No backfill, rollback is safe (columns unused).
+- Depends on option chosen in I-3. If gift card tickets are returned in the orders feed they need new `ticket_request_table` columns (migration). If a separate API is used, **no DB change** (in-memory/API only). Rollback: unused columns can stay.
 
 ### 5.4 Performance Impact
-- Low. One more MQTT event type, one extra smart-panel item type, and a refresh trigger on Orders Hub. Remove the 1-second polling loop for kiosk items.
+- Low. Add debounce/query for search. Gift card tickets add rows to Orders Hub; keep pagination.
 
 ### 5.5 Backward Compatibility
-- Setting defaults to OFF, so behavior is unchanged until enabled in WebDash.
-- Mixed fleet: older POS builds will show kiosk tickets as already paid (current behavior) and may not show the alert.
-- Gradual rollout via the WebDash toggle per location. No separate app flag.
+- **Feature flag:** recommended. Gate by the new "Refund Gift Card" permission and a backend flag per restaurant.
+- **Mixed fleet:** older POS builds show no gift card tickets and no refund action (current behavior).
+- **Legacy cards:** no action (PRD out of scope); the legacy marker must come from the backend.
 
 ---
 
@@ -189,40 +185,41 @@ Paths under `pos/src/main/java/aio/app/pos/` unless stated.
 
 | Risk | Probability | Impact | Mitigation |
 | --- | --- | --- | --- |
-| Unpaid kiosk ticket auto-discarded or cleaned up | Medium | **High** | Exclude from all discard paths; add tests; verify item status with backend |
-| Backend contract not ready or different | High | **High** | Agree the contract first (I-1); POS work starts after |
-| Cashier misses an order (Orders Hub not live, sound cut off, panel lost on restart) | Medium | High | Refresh trigger on insert, persist alerts, queue sound |
-| Wrong totals after partial payment (cached paymentInfo) | Medium | High | Verify and recalc locally |
-| Duplicate or missed auto-void at clock-out | Medium | Medium | Server-side void; POS reacts to MQTT |
-| Void with partial payment fails | High | High | Product/backend decision on refund (I-8) |
-| Silent loyalty deletion on guest change | High | Medium | Pre-check with message (I-9) |
-| Kitchen double fire (post-payment + manual) | Medium | High | Reuse the KDS CR's single-send rule |
-| Scope growth (tips on POS, red-flag, order-ready email) | Medium | Medium | Confirm scope in Open Questions |
+| Double refund across POS and MOM or by retry | Medium | **High** | Server-side lock + idempotency key; refresh ticket before confirm; in-flight guard |
+| Used card refunded (balance/same-day rule wrong) | Medium | **High** | Server enforces the rule; client only displays and disables; pure-function tests |
+| Refund to the wrong tender | Low | High | Auto-select original tender; no override |
+| Backend contract not ready | High | **High** | Agree contract first (I-1); POS starts after |
+| Refund succeeded but POS shows failure (timeout/background) | Medium | High | Refresh by ticket id after a timeout; replay-safe success state |
+| Gift-card-tender refund opens drawer / wrong cash log | High | Medium | Gift card path skips cash drawer (I-7) |
+| Sensitive data in logs | High | Medium | Remove now (I-8) |
+| Ticket refunded on MOM not visible on POS until reopened | High | Medium | Fetch ticket state on open and before submit |
+| Scope growth (reload refund, multi-card UX) | Medium | Medium | Confirm in Open Questions |
 
 **Rollback strategy**
-- Turn "Pay at counter" OFF in WebDash to stop kiosk pay-at-counter orders and hide the Pending tab, with no app release.
-- If the POS change has a defect, halt rollout or revert the PR. New columns can stay.
+- Disable the feature flag / "Refund Gift Card" permission to hide the action with no app release.
+- If the POS change has a defect, halt rollout or revert the PR. Gift card state changes made by the backend cannot be undone by a client rollback.
 
 **Monitoring plan**
-- New Relic events: kiosk ticket received, alert shown/expired, ticket discarded (should be zero for unpaid kiosk), void/delete (with reason), auto-void, post-payment send.
-- Alert on unpaid kiosk tickets older than the abandonment threshold and on kiosk tickets that disappear without a void/delete/pay event.
+- New Relic events: gift card ticket opened, refund started / success / failed (with ticket id and card id, never card number or PIN), refund blocked (reason), duplicate suppressed.
+- Alert on a refund request without a matching completion, and on any `refund-initiated` ticket older than the timeout.
 
 ---
 
 ## 7. Open Questions (blocking)
 
-1. **Backend:** Which MQTT event carries a kiosk pay-at-counter ticket? Is it sequenced, and are `deviceIds` targeted or broadcast? What are the ticket status, item status (`pending` or `send`) and payment status on arrival?
-2. **Item delete:** Is deleting a kiosk item a "Remove" (no approval) or a "Void" (permission, manager approval)?
-3. **Void with partial payment:** What is the refund/reconcile behavior (US11)? Today a partially paid ticket cannot be voided.
-4. **Delete (no trace):** Does the backend hard-delete with no report trace? Which sources and roles may delete?
-5. **Auto-void at clock-out:** Is it server-side? Which clock-out counts (employee, manager, location-wide)? What happens offline?
-6. **Tip capture:** Where is tipping captured on POS after the kiosk tip prompt is removed (payment screen, add tip later)? PRD only says "capture tipping on the POS".
-7. **Attribution:** How is "Kiosk" set as sales/tip source with no server? Backend, POS, or both?
-8. **Red-flag abandonment cue:** What threshold and where does it show? The PRD mentions it but defines no rule.
-9. **15-minute side panel:** Is it counted from the kiosk order time or the POS arrival time? Does the alert reappear after dismissal or restart?
-10. **Guest email:** Which field on the ticket, and does the POS show it or only keep it?
-11. **KDS toggle:** Per-location setting shared with the KDS CR. Is it the same flag as "Send to Kitchen post payment"?
-12. **Pending tab wording:** The PRD says an "All orders" dropdown. Orders Hub has tab rows. Confirm the design maps to the existing Pending status tab.
+1. **Backend:** Which endpoint returns gift card purchase tickets for Orders Hub and MOM? Is the ticket the same object as a normal ticket? Which fields are provided (original balance, issue date, legacy, type, delivery status, order source/type)?
+2. **Eligibility rules conflict in the PRD.** Story 1 says the action is enabled when balance < original ("user will select the card to refund") and also when the refund is the same day; Story 2 (MOM) says it is hidden with "card already used" after the purchase date. **What is the final rule?** Where is it enforced (server preferred)?
+3. **"Same calendar day":** In which time zone, and from which timestamp?
+4. **Reload refunds:** The PRD says only the reloaded amount is refunded. How is a reload represented as a separate refundable line? The POS has no reload-sale flow today.
+5. **Partial refund and partial usage:** Can a card be refunded for the remaining balance only? Today one refund per payment is allowed.
+6. **Original tender = gift card:** To which card is value returned (the same card)? Which endpoint? Is the refund of a gift-card-tender purchase also a "refund of a gift card purchase"?
+7. **Cash refunds on POS:** Does the cash drawer open for the cash-purchase refund? How is it logged?
+8. **Physical reload after refund:** Is a "reloadable" flag displayed on the POS, or is it backend-only? Does the existing reload flow need to accept refunded cards?
+9. **Digital card + recipient email:** Where is recipient email captured on POS today? (No digital sale or email capture was found in the POS code.)
+10. **Lock:** How does POS learn that MOM refunded? Is there an MQTT event, or only a fetch on open?
+11. **Permission:** Name and default roles for "Refund Gift Card"; does the manager approval PIN apply?
+12. **Receipts:** Printed refund receipt content for a gift card; email goes to the purchaser's address from the original payment?
+13. **"Order Type = Digital Gift Card" and "Order Source = POS/Online"** values: confirm the exact backend strings.
 
 ---
 
