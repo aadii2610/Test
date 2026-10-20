@@ -1,8 +1,13 @@
-# Tech Analysis — Gift Card Visibility and Refund (POS)
+# Tech Analysis — Gift Card CRs on POS: Digital Purchase, Merge, Migration to Digital, Reload
 
-**PRD:** [Gift Card Visibility and Refund](https://app.notion.com/p/aio-app/Gift-Card-Visibility-and-Refund-3b55b13baaa38021810cec88bc720544)
-**Figma:** [POS Payments](https://www.figma.com/design/UOxJw6F6BPq7rIZU13qy0Q/POS-Payments?node-id=15385-80275)
-**Scope of this doc:** POS (Android) only. MOM app, Backend, Reports, Online Ordering and Gift Cards ledger work is listed as dependencies.
+**PRDs (4 CRs, one analysis):**
+1. [Change Request: Digital Gift Card Purchase on POS](https://app.notion.com/p/aio-app/Change-Request-Digital-Gift-Card-Purchase-on-POS-3a85b13baaa380fbba46c2e96aad530d)
+2. [CR: Gift Card Merge on POS](https://app.notion.com/p/aio-app/CR-Gift-Card-Merge-on-POS-25-07-2026-3a85b13baaa38058a0d0ed5f4170b48d)
+3. [CR: Gift Card Migration to Digital on POS](https://app.notion.com/p/aio-app/CR-Gift-Card-Migration-to-Digital-on-POS-25-07-2026-3a85b13baaa38092879ced0cddc946d5)
+4. [CR: Gift Card Reload on POS](https://app.notion.com/p/aio-app/CR-Gift-Card-Reload-on-POS-25-07-2026-3a85b13baaa380a2ac51ef15af1b8f12)
+
+**Related:** `GIFT_CARD_VISIBILITY_AND_REFUND_TECH_ANALYSIS.md` (refund, same gift card code)
+**Scope of this doc:** POS (Android) only. Backend, E-card provider, Marketing ledger and Reports are dependencies.
 **Status:** Pre-implementation analysis. No code changed.
 
 ---
@@ -11,101 +16,107 @@
 
 | Field | Value |
 | --- | --- |
-| **Jira Ticket** | *(pending)* |
-| **Feature Name** | Gift Card Visibility and Refund |
-| **Module / Layer Affected** | **Cross-module.** UI (Orders Hub, ticket pane, refund flow), Domain/Data (new gift card ticket model, refund API), Backend, MOM app, Reports, Receipts. |
+| **Jira Ticket** | *(pending: one epic, four stories recommended)* |
+| **Feature Name** | Gift Card: Digital Purchase, Merge, Migration to Digital, Reload |
+| **Module / Layer Affected** | **Cross-module.** UI (gift card screens, customer-facing display "CFD"), Domain/Data (new gift card APIs and models), Payment (gift card ticket), Receipts, external services (E-card API, Marketing ledger, Backend). |
 | **Tech Lead / Owner** | *(pending)* |
-| **Estimated Complexity** | **L4**. The client has no gift card ticket in Orders Hub, no gift card refund API, and most required fields are missing from the DTOs. |
-| **Initial Risk Level** | **High**. Money movement (refund + balance zeroing) across two apps with no idempotency key today. |
-| **Dependencies** | **Backend (critical):** gift card ticket in the orders list/search, card state fields, refund endpoint, atomic refund + deactivate, refund lock. **MOM app**, **Reports**, **Receipts**, **Online Ordering**. **Internal:** refund flow, `AllowedFeature` permissions. |
+| **Estimated Complexity** | **Epic L4.** Per CR: Digital Purchase **L4**, Reload **L3**, Migration **L3**, Merge **L3**. |
+| **Initial Risk Level** | **High**. Money, card balances and PINs; none of the four server APIs exists on the client. |
+| **Dependencies** | **E-card API** (card details + delivery), **Backend** (digital purchase, reload, merge, migration endpoints, templates, delivery), **Marketing module** (merge ledger event), **Reports** (reload impact), **Internal:** `GiftCardActivity`, `PaymentParentFragment`, CFD framework. |
 | **Target Release Date** | *(pending)* |
 
-### Business Context
+### The four CRs at a glance
 
-- **Problem:** A gift card sale has no guaranteed searchable ticket, and nothing stops a used card from being refunded. Risks are double liability (guest refunded, card still spendable) and unreconciled reports.
-- **User impact:** Staff find a gift card purchase in Orders Hub, and refund it with guardrails, from POS or MOM.
-- **Success criteria:** No refund of a used card, no double refund across POS/MOM, a refunded card is zeroed and deactivated in the same action, and Reports show the refund in the same period.
+| CR | What it adds | Entry point | Needs |
+| --- | --- | --- | --- |
+| **Digital purchase** | Buy a digital card (design, amount, recipient, Email/Text delivery, message), full payment only, delivered by the E-card flow | New "Purchase Digital Card" button | 9 screens, design gallery, E-card API, CFD forms, validation |
+| **Merge** | Merge several cards (physical + digital) into one parent card | New "Merge Cards" button | Pop-up, parent/child rules, new merge API, ledger event |
+| **Migration to Digital** | Transfer a Toast/Cake card to a **digital** AIO card (today: physical only) | Existing transfer icon on the card row | Type chooser, name/phone/email form, E-card API, email with number + PIN |
+| **Reload** | Add value to an existing card from the POS and pay for it | New reload icon on the card row | Reload dialog, payment, receipt, multi-card flows |
 
-### PRD scope → what exists today (summary)
+### Shared building blocks (why one doc)
 
-| PRD item | Today in POS | Gap |
-| --- | --- | --- |
-| Search gift card tickets in Orders Hub (order no., guest, card no.) | **Gift card tickets are not in Orders Hub.** They are backend objects (`POST /api/gift-card/ticket`), not in Room. Search is local and does not search card numbers. | New data source, new search field |
-| Order source (POS/Online) and order type (Digital Gift Card) | Not found. Only `orderType = "gift-card"` is sent for card-paid purchases. | New fields and enums |
-| "Refund Gift Card" action on ticket detail | **No gift card refund code.** `GiftCardActivity.onRefundClicked` has no callers. Ticket detail buttons fall back to "no buttons" for unknown types. | New action, new flow |
-| Eligibility (unused card / same day / not legacy) | Not found: original balance, issue date, legacy flag, deactivated state | Backend fields needed |
-| Per-card and per-reload refund; Partially Refunded / Refunded | Refund is amount-component based (subtotal, tax, tip…). Per-line refund is not supported. No distinct "Partially Refunded" badge. | New per-card flow |
-| Mandatory reason | A reason exists but a default is pre-selected ("Bad food quality") and the list is food-oriented | Change reason UX for gift cards |
-| Reuse original tender | Implicit: card goes to one API, everything else to another. No auto-match. | Needs a rule + server confirmation |
-| Digital refund receipt to purchaser | Email receipt exists, address typed by hand. Purchaser email is in the model but unused. | Prefill + gift card receipt |
-| Zero + deactivate; reloadable / blocked | Not found | Backend |
-| Lock across POS/MOM | Not found. Client uses a cached ticket snapshot and no idempotency key. | Server lock + refresh |
-| New permission "Refund Gift Card" | `AllowedFeature` model exists; no gift card refund entry | New `AuthEnum` + server feature |
-| Reports | Server-side only | Backend |
+- **Same screens and files:** `GiftCardsMainFragment`, `GiftCardScannedFragment`, `GiftCardScannedAdapter`, `GiftCardBillFragment`, `LoadGiftCardDialog`, `TransferGiftCardDialog`, `PayBy*Fragment`.
+- **Same new dependencies:** the E-card API (purchase + migration), the CFD customer form (purchase + migration), email/phone validation (purchase + migration), and the bill/payment path (purchase + reload).
+- **Same blocker:** the scanned-card list and bill are hard-wired to `INVENTORY` ("New") cards. Reload, merge and migration all need other card sources to behave differently.
 
 ---
 
 ## 2. Existing Code Review
 
-Paths under `pos/src/main/java/aio/app/pos/` unless stated.
+Paths under `pos/src/main/java/aio/app/pos/` unless stated. `G/` = `ui/giftcard/`, `P/` = `ui/giftcard/presentation/`.
 
 ### 2.1 Architecture & Layering
 
-- **Gift card sale is a separate flow, not a normal ticket.** `GiftCardActivity` (2,749 lines) → `GiftCardBillFragment` → payment through `PaymentParentFragment.handleGiftCardTicket` (L347) with `isFromGiftCard` / `giftCardTicketId` bundle args. The ticket is created via `POST /api/gift-card/ticket` and paid via `POST /api/payment/process-payment` (`type = "giftCardTicket"`). `PaymentParentFragment` notes it is "not stored in DB".
-- **Orders Hub reads only Room `ticket_request_table`**, which has no gift card fields. `OrderHubTypesEnum` and `OrderHubSourceEnum` have no gift card or digital values. There is no "gift" string under `orderhub`.
-- **Ticket detail actions** come from `TicketUtils.getStatusTypes` (~L140–245). Any type that is not third-party/delivery/takeout/dine-in falls to `else -> VOIDED` (L238, L242) and **shows no buttons**, so a gift card type needs an explicit branch.
-- **Refund flow already exists** as six fragments under `ui/main/fragments/refund/`: `PaymentSelectionFragment` → `RefundAmountSelectionFragment` → `RefundReasonFragment` → `RefundConfirmationFragment` → `RefundCompleteFragment`, driven by `PaymentParentFragment.startRefundFlow` (L680–717). The repo document `REFUND_MAIN_FRAGMENT_NAVGRAPH_MIGRATION_SOLUTION.md` is **stale** (`RefundMainFragment` no longer exists).
-- **Refund state** is plain `var`s in `RefundRepository` (Koin `single`), with no thread safety. The ticket is cached there when the flow starts.
-- **Permissions:** `AllowedFeature` (Room) read via `loadAllowedFeatureByRoleAndFeatureName(roleId, AuthEnum.X.feature)`. `AuthEnum.REFUND_VISIBLE` exists; `GIFT_CARDS_VISIBLE` is defined but **never used**. Gift cards are gated only by `isGiftCardEnabled`. Manager PIN (`approve-with-pin`) sends only `restaurantId` and `pin`, with no feature name.
-- **Duplication / size:** `PayByGiftCardFragment` 3,538 lines (builds the same purchase request in two places), `TsrTicketViewModel` 2,244 lines with ~10 gift card `SharedFlow`s, `RegisterActivity` 4,938, `OrdersHubParentActivity` 2,961. `BackendPaymentEnum` and `OrderHubPaymentEnum` are near-duplicates with different strings (`"refund"` vs `"full-refund"`).
+**What exists today**
 
-### 2.2 Concurrency
+- **Landing screen** (`P/GiftCardsMainFragment.kt`, 330 lines): scan area and "Enter card number manually" only. There are **no Purchase Digital or Merge buttons.** A hidden `btnSwitchToGuest` exists.
+- **Scanned list** (`G/adapters/GiftCardScannedAdapter.kt`): `INVENTORY` cards show an editable amount row ("New"). **Every other source gets a Transfer-only row** (transfer, print, remove). There is **no reload icon**.
+- **Transfer** (`G/dialogs/TransferGiftCardDialog.kt`): `POST /api/gift-card/transfer-balance` with `{fromCardNumber, toCardNumber}`. The **target must be an `INVENTORY` card**. There is **no physical/digital chooser**. Transfer is disabled for `DIGITAL` cards, for already-transferred cards and for zero balance.
+- **Reload is blocked in six places** by `INVENTORY`-only filters: `GiftCardScannedFragment.updateBillFragment` (L872–890), the adapter view type (L30), `updateAllNewCards`, remove handling (L125), `addCardItem` (L467–480), and the receipt filters in `PayByCard/Cash/Tender/GiftCardFragment`.
+- **Merge:** the words merge/parent/child **do not exist** in the gift card code.
+- **Gift card bill:** `GiftCardBillFragment` sums the bill items, applies an optional dollar/percent discount to the whole subtotal, then `PATCH /api/gift-card/ticket`, then hands over to the payment fragments through bundle args (`isFromGiftCard`, `giftCardTicketId`). **The gift card ticket is not in Room.**
+- **Payments for a gift card ticket:** full payment is already enforced (`BillFragment.setupGiftCardFlow` ~L685–740: split/partial widgets hidden, status = paid). Methods: Cash, Tender, Card and Manual Card (terminal ready and amount ≥ 0.50; manual needs `ADYEN_AMS`), Gift card (as tender). **This part of the Digital Purchase CR already exists.**
+- **E-card:** `isECardEnabled` is only a restaurant flag that gates the gift card menu. **No E-card endpoint, DTO, design/template/category list or image loading exists.** The word "ecardsystems.net" appears only in a barcode URL parser.
+- **Data model for delivery** (`UserGiftCardPayment`: purchased_by_*, recipient_*, message, security_code) is **read-side only**. `GiftCardTicketRequestDTO` carries only `cardNumber`, `topupAmountInCents`, `giftCardId`, so **recipient, delivery method and message cannot be sent today**.
+- **Reload fields already exist in DTOs** (`topupAmountInCents`, `existingBalanceInCents`), but the UI only echoes them when restoring a ticket.
 
-- Refund is **online-only**, a direct API call with a 150 s timeout, no queue, no retry (`ApiService.kt:201–207`).
-- **No in-flight guard** in the ViewModel. Protection is only hiding the confirm button and `setSafeOnClickListener`.
-- **No idempotency key** in `RefundRequest` or `CashRefundPost`. On timeout the UI reverts after 3 s and the user can retry.
-- **If the app is backgrounded**, `RefundSuccess` (SharedFlow, no replay, `repeatOnLifecycle(STARTED)`) can be lost and the UI stays on "processing".
-- Orders Hub search loads and maps **all tickets on every keystroke** with no debounce (`OrdersHubSearchRepoImpl.kt:50–84`).
+### 2.2 CFD (customer-facing display)
 
-### 2.3 Data Layer
+- **Same device, same process.** The CFD is an Android `Presentation` on a second display (`SecondaryScreenPresentation`). Handoff is `SecondaryScreenHandler` with a UI-state flow (replay 1) and a user-action flow (**no replay, no buffer**).
+- **Adding a form needs:** a new `SecondaryScreenUiState`, a new `UserAction`, a branch in the Presentation, and a collector in the host fragment.
+- **Precedents for customer-entered values:** `IdleMarketingSecondaryScreen` (name + phone + consent), `LoyaltyLoginSignupFormSecondaryScreen`, `ReceiptSecondaryScreen` (email), and gift card number/PIN entry in `PayByGiftCardFragment`. The gift card CFD flow is **quick-serve only** (TSR uses the POS screen).
+- **Keyboard:** the CFD uses an external custom keyboard AAR (`aio.app.keyboard:keyboard:0.0.16`) through `KeyboardConfig.setUpKeyBoard`, not the system keyboard.
+- **Waiting state:** `CardPaymentProcessing` shows "Guest is entering…" with a Skip button and a switch-back button. Tip and gift card entry have **no timeout**; the cashier cancels.
+- **CFD is optional:** `isSecondaryScreenEnabled` is a restaurant setting; fragments never check whether a display is attached. With the setting on and no display, the state is emitted and **nobody renders it** (no automatic fallback).
+- **Label mismatch:** the PRD says "Switch to CFD"; the existing button is "Switch to guest".
+- **Multi-step form on the CFD (name, recipient, delivery, message) does not exist** and must be built (the PRD calls for 3 CFD screens in the purchase flow, 2 in migration).
 
-- **Present on the client:** `GiftCardValidateDataDTO` (id, cardNumber, amount, status, source, balance), `GiftCardSource` (inventory, migrated, physical, digital; `migrated` is the only plausible legacy marker), `GiftCardTicketItemRequestDTO(cardNumber, topupAmountInCents, giftCardId)`, `UserGiftCardPayment` (initial_amount, balance, status, recipient_*, purchased_by_*; attached only when a gift card is used as **tender**).
-- **Not found:** issue date, legacy/cutover flag, delivery status, digital boolean, reloadable flag, deactivated state, original issued balance on the card DTO, order source and order type on gift tickets, any refund state or origin, any Room entity for gift cards.
-- **No gift card refund, deactivate, reload-reversal or credit-back endpoint exists.** Gift card endpoints are `ApiService.kt:903–972`. The payment SDK (`aio.app.common:payment-core`, external) was not inspected for refund support.
-- **No standalone reload-sale flow** found on the client (only `inventory` cards enter the bill; existing cards show Transfer only), although DTOs carry `topupAmountInCents` and `existingBalanceInCents`. PRD story "reloads refunded as separate lines" has no matching client model.
-- **Digital sale and recipient email capture** was not found on the POS (`GiftCardSource.DIGITAL` only disables Transfer).
-- **Refund endpoints today:** `POST api/payment/refund` (card only), `POST api/payment/refund/{ticketId}` (everything else, no card number in the payload), `GET api/payment/refund/{ticketId}`. When the original tender is a gift card, the server must credit the card.
-- **Money types:** `Double` in DTOs, `String` in `RefundMetaData`; amounts are `roundToInt` of grand total × 100 (`RefundConfirmationViewModel.kt:221`). Calculator uses BigDecimal HALF_UP.
-- `MqttTicketMapper.kt:293–294`: `refundedserviceChargeAmount` and `refundedGratuityAmount` are commented out, so those fields are dropped for payments arriving via MQTT.
+### 2.3 Concurrency
 
-### 2.4 UI & State Management
+- `giftCardValidateResponse` in `TsrTicketViewModel` is a `SharedFlow(replay=0)` with **four collectors**, and a scan in any dialog also feeds the scanned list. **A merge dialog that scans cards must not share this flow**, or the scanned fragment will also add the card.
+- A late collector misses events: `GiftCardsMainFragment.observeCurrentTicket` (L255) can miss the `getCurrentGiftCardTicket` response fired in `GiftCardActivity.onCreate` (L270), leaving `ticketId` null and **Pay failing with "Ticket ID not found"**.
+- CFD user actions are emitted on a global scope into a **no-replay** flow, so an action is **dropped if no collector is active**. Several screens collect the same flow (`RegisterActivity`, payment fragments, `LoyaltyMenuDialogFragment`).
+- Gift card settings (min, max, presets) are fetched in `RegisterActivity` (L615–617), but `GiftCardActivity` is reachable from other drawers, so `LoadGiftCardDialog` **may get empty settings** and then skips range validation.
 
-- **Refund eligibility today:** `onConfirmClicked` blocks a payment already `full-refund`, `partial-refund` or `refund-initiated`. **A partially refunded payment cannot be refunded again.** Full vs partial uses a 0.01 tolerance.
-- **Reason:** 7 fixed radio options plus "Other", and `rBtnOne` ("Bad food quality") is `checked="true"` by default (`fragment_refund_reason.xml:92`), so the reason is **effectively pre-filled, not mandatory**. An empty custom reason is ignored. The PRD requires a mandatory reason.
-- **Status badge:** `OrdersHubTicketAdapter.kt:297–306` shows one "Refund" badge for full and partial. The filter dialog distinguishes them.
-- **Reason and refunding staff** are stored per `Refund` (`reason`, `refundedBy`, `approvedBy`) but shown only in payment-log history and on the printed receipt, **not on the ticket detail** (PRD requires them visible).
-- **`approvedBy` is never populated:** `Constants.APPROVAL_USER_ID` is read in `RefundConfirmationViewModel.kt:214,386` and **no code writes it** (verified across `pos` and `commons`). The approver always equals the refunder.
-- **Gift card lines** render as pseudo `TicketItem`s built from bundle args (card number in `itemDescription`), not from the DB (`TicketItemBillAdapter.kt:115`).
-- **Side effect:** `cashRefund` always logs `CASH_REFUND` and emits `OpenCashDrawer` for **every non-card tender** (gift card, tender, mke, moto), so the drawer opens and a cash drawer entry is sent for a gift-card-tender refund (`RefundConfirmationViewModel.kt:389–396, 471`).
-- **Already-refunded lock:** the refund flow caches the ticket in `RefundRepository.ticketData` when it starts and refreshes only on `DeliveryStatusUpdated`. A refund made on MOM mid-flow is not seen, and the "already refunded" check uses the stale snapshot (`RefundConfirmationViewModel.kt:113`). There is no `REFUND_*` MQTT event; payment changes arrive as `TICKET_PAYMENT_UPDATE` → `handlePaymentEvent`, and gift card tickets are not delivered that way.
-- **Receipts:** printed refund receipt (`TicketReceiptMapper.refundReceipt`) has no gift card, purchaser or card info. Email receipt: `POST /api/payment/receipt/{paymentId}` (`receiptType = "refund"`, `refundId` required; address typed by hand), and a gift card variant `POST /api/payment/gift-card/receipt/{paymentId}`. `Payment.userGiftCardPayment.purchasedByEmail` exists but no refund code uses it.
+### 2.4 Data Layer
 
-### 2.5 Performance & Memory
+- **Not found:** E-card, digital purchase, reload, merge and migration endpoints. Existing gift card APIs: validate (+PIN), ticket create/update/delete/current, transfer-balance, settings, process-payment, receipt (`ApiService.kt:903–972`).
+- `createGiftCardTicket` is declared but **never called from the UI**.
+- `GiftCardSettingsDTO.presetAmounts` is `List<Int>` and `LoadGiftCardDialog` works on **whole numbers only** (max 6 digits). PRD presets differ: purchase $25/50/100/150, reload $25/50/100/200 (settings supply a list; the dialog keeps at most 5).
+- **Discount** math is duplicated in three places (`GiftCardBillFragment.kt:213, 626`, `GiftCardActivity.kt:452`). The PRD says a gift card purchase discount also applies to reload amounts, which is already true because the discount applies to the whole bill subtotal once reload lines can enter the bill.
+- `replaceCard` (after transfer) builds a new item **with no source, giftCardId or amount**.
+- **Commission split:** no "commission" code exists. The gift card card-payment path hard-codes `applicationFeeInCents = 0` and `discount = "0"` (`PayByCardFragment.kt:1811, 1822, 1842`). The Reload CR says "the configured POS commission split will be applied".
 
-- Search-on-keystroke over all tickets is the only notable cost, and it grows if gift card tickets are added to the same list. Add a debounce or move the search to a query.
-- No new heavy payloads expected.
+### 2.5 UI & State Management
 
-### 2.6 Reliability & Stability
+- Scanned list and bill state are **synced manually** between adapter and `GiftCardViewModel` (`syncRepositoryWithAdapter`, `updateBillFragment`).
+- **Global state:** `Constants.QsrGiftCard/QsrGiftPin/TsrGiftCard/TsrGiftPin/giftCardBalance`, top-level `var enteredPassword`, and `SharedDataRepository.giftCardAllCardsList/giftCardList/giftCardSettings` (cleared in several places).
+- **Receipts:** four near-identical `printGiftCardReceipt` copies (`PayByCard/Cash/Tender/GiftCardFragment`). All filter to `INVENTORY` cards, so **reloaded cards would be missing from receipts**. The receipt prints the full card number (card footer masked) and no PIN. **No reload, merge or transfer receipt exists.** The Cash variant lacks the empty-printer check.
+- **Delivery is backend-side:** the POS calls a receipt endpoint (`/api/payment/gift-card/receipt/{paymentId}`) with an email or mobile number. Whether it can deliver a card to a **recipient** (not the purchaser) with a personal message is not visible from the client.
+- **Validators:** email regex is copied in three places; phone validators are US-only (two different ones). **No message length-limit utility exists**; error patterns differ between CFD (toast or inline) and POS (snackbar).
+- **Permissions:** `AuthEnum.GIFT_CARDS_VISIBLE` is defined but **unused**; `navGiftCard()` has no permission check.
 
-- **Privacy / security (found while tracing):**
-  - `TsrTicketViewModel.getGiftCardBalance` (~L2050) **logs the gift card number and PIN to New Relic.**
-  - `ClockInViewModel.kt:122` puts the **raw manager PIN** into a New Relic log map.
-- **Idempotency gap** (§2.2) and **stale snapshot** (§2.4) are the two main double-refund risks. Double-refund prevention today is server-side only (the `refund-initiated` state).
-- Gift card tickets are not in Room and not updated by MQTT, so a refund done elsewhere is never reflected locally.
+### 2.6 Performance & Memory
 
-### 2.7 Test Coverage
+- The CFD UI state carries ViewModels, `LifecycleOwner` and `Context` for gift card approval screens (leak risk), a pattern the new forms should avoid by passing plain data.
+- Design gallery needs image loading and caching (Glide 4.16 is available). No gallery exists. Design count, image size and caching are unknown.
+- No other notable performance concerns. All operations are online API calls.
 
-- No tests for gift cards, Orders Hub, or refunds. Existing tests: `TicketMappersTest`, `ApiQueueRetryLimitTest`, `MenuRefreshPocTest`, example tests. `payment_calculator` has no refund tests.
+### 2.7 Reliability & Stability
+
+- **All gift card operations are online-only** (no offline checks); failures show snackbars.
+- **PCI/PII in logs.** `logNewRelicEvent` has no masking. Confirmed in the code:
+  - The **gift card PIN** is logged (`TsrTicketViewModel.kt:2051` `GIFT_CARD_PIN`; `RegisterActivity.kt:1591, 1607, 1649`).
+  - Full **gift card numbers** are logged (`TransferGiftCardDialog`, `GiftCardScannedFragment`, `GiftCardBillFragment`).
+  - Customer **email, phone and name** are logged (`PayByGiftCardFragment.kt:3405–3478`), plus a receipt body with email/phone (`MainViewModel`) and `card: $card` (`AioPrinterViewModel.kt:1033`).
+  - The new flows add recipient name, email, phone and personal message, and migration adds a **new PIN**. They must not be logged.
+- **Cancel flow:** the Digital Purchase CR says Cancel at any step creates no card and no charge. No gift card ticket may be created before payment succeeds (or it must be deleted on cancel; `DELETE /api/gift-card/ticket/{id}` exists).
+- **Fulfilment failure:** payment succeeds but the E-card call fails. There is no existing pattern for "paid but card not loaded".
+
+### 2.8 Test Coverage
+
+- **No gift card tests** anywhere (no discount math, payment flows, ViewModels, CFD, validators or receipts). The repo has about 12 test files in total.
 
 ---
 
@@ -113,22 +124,24 @@ Paths under `pos/src/main/java/aio/app/pos/` unless stated.
 
 | # | Category | Issue | Severity | Risk Impact |
 | --- | --- | --- | --- | --- |
-| I-1 | Backend contract | No gift card ticket list/search, refund endpoint, card state fields (original balance, issue date, legacy, deactivated, reloadable), atomic refund + deactivate, or refund lock exists in the client contract | **Critical** | Blocks the design |
-| I-2 | Money | No idempotency key and no in-flight guard on refund; stale cached ticket; refund can be retried after timeout | **Critical** | Double refund |
-| I-3 | Architecture | Gift card tickets are not in Orders Hub/Room; search ignores card numbers; no gift card type/source enums | High | Core PRD story cannot work as-is |
-| I-4 | Architecture | Per-card / per-reload refund does not exist; current refund is amount-component based and one refund per payment | High | PRD multi-card and reload scenarios unsupported |
-| I-5 | Business rule | Reason is pre-selected and not mandatory; the options are food-specific | High | Audit requirement unmet |
-| I-6 | Business rule | `approvedBy` never populated; reason/refunding staff not shown on ticket detail | Medium | Audit fields missing (PRD asks for both) |
-| I-7 | Business rule | Gift-card-tender refunds open the cash drawer and write a cash drawer log | High | Wrong cash records |
-| I-8 | Security | Gift card number + PIN and raw manager PIN logged to New Relic | High | Sensitive data exposure |
-| I-9 | Data | Original tender "reuse" is implicit and server-decided; no auto-match | Medium | Wrong tender possible |
-| I-10 | Permissions | No "Refund Gift Card" permission; `GIFT_CARDS_VISIBLE` unused; manager PIN is not feature-scoped | Medium | Cannot restrict by role |
-| I-11 | Reliability | `RefundSuccess` lost on background; UI stuck on "processing" | Medium | Staff retry and double refund |
-| I-12 | UI | `getStatusTypes` falls to no buttons for unknown types; "Refund" badge for full and partial | Medium | No action on gift card tickets; unclear status |
-| I-13 | Data | Purchaser email unused; email typed by hand; MQTT drops `refundedserviceChargeAmount` / `refundedGratuityAmount` | Low | Receipt friction; missing refund fields |
-| I-14 | Architecture | Duplicate payment enums; gift card purchase request built in two places; stale refund doc | Low | Maintenance |
-| I-15 | Performance | Search over all tickets per keystroke, no debounce | Low | Lag as the list grows |
-| I-16 | Test | No tests on gift cards or refunds | Medium | Regression risk on money code |
+| I-1 | Backend contract | No E-card, digital purchase, reload, merge or migration API on the client. Delivery of a card to a recipient (with message) is undefined | **Critical** | Blocks all four CRs |
+| I-2 | Security / PCI | PIN, full card numbers, email, phone and name are logged to New Relic; new flows add more PII and a new PIN | **Critical** | Sensitive data exposure; must not grow |
+| I-3 | Architecture | List, bill and receipts are hard-wired to `INVENTORY` cards (six places) | High | Reload and merge cannot work; reloaded cards missing from receipts |
+| I-4 | Fulfilment | Payment can succeed while E-card load/delivery fails; no recovery pattern | High | Customer pays, gets no card |
+| I-5 | Money | Merge and migration move balance between cards; no idempotency key, no in-flight guard, no rollback | High | Duplicate or partial transfer |
+| I-6 | Architecture | No CFD multi-step form for gift cards; CFD user actions are dropped without a collector; CFD is optional with no fallback | High | Purchase/migration flow can stall or lose input |
+| I-7 | Concurrency | `giftCardValidateResponse` has four collectors and replay 0; a merge scanner would double-add cards; a late collector misses the current-ticket response | High | Wrong cards added; "Ticket ID not found" |
+| I-8 | Business rule | Commission split is not found in code; gift card card payment hard-codes fee 0 | High | Reload commission rule unmet |
+| I-9 | Data | Request DTO has no recipient/delivery/message/sender fields; `replaceCard` drops source and card id after transfer | High | Data lost or cannot be sent |
+| I-10 | Business rule | Transfer is blocked for `DIGITAL` and requires an `INVENTORY` target; merge rules (physical + digital, parent choice) are undefined | High | Migration and merge rules conflict with today's rules |
+| I-11 | UI | No design/template gallery, category list or image loading | Medium | Whole screen is new work |
+| I-12 | UI | No validation framework: email regex copied 3 times, US-only phone checks, no length-limit utility | Medium | Inconsistent validation |
+| I-13 | Architecture | Settings (min/max/presets) fetched only in `RegisterActivity`; dialog skips validation if missing; whole-number-only amounts | Medium | Invalid amounts or wrong presets |
+| I-14 | Architecture | God classes, global state (`Constants.*GiftCard/Pin`) and duplicated code: 4 copies of receipt printing, discount math in 3 places, `isFromGiftCard` in 106 places | Medium | Every change touches many files |
+| I-15 | Permissions | `GIFT_CARDS_VISIBLE` unused; no role gating for new actions | Medium | No way to restrict merge/migration/reload by role |
+| I-16 | Reporting | Reports are server-side; POS only sends `orderType="gift-card"` for card payments (cash/tender/gift card send none) | Medium | Reload may be missing from Sales Summary, Gift Card, Checkout and Z reports |
+| I-17 | UX | PRD says "Switch to CFD"; code says "Switch to guest"; SMS button commented out on the CFD receipt | Low | Naming and capability mismatch |
+| I-18 | Test | No gift card tests | Medium | Regression risk on money code |
 
 ---
 
@@ -136,48 +149,52 @@ Paths under `pos/src/main/java/aio/app/pos/` unless stated.
 
 | Issue | Fix now? | Justification | Backlog Ticket | Target Sprint |
 | --- | --- | --- | --- | --- |
-| I-1 Backend contract | **Y (first)** | Everything depends on it. Agree endpoint and fields with Backend/MOM first | *[Ref]* | *[Sprint]* |
-| I-2 Idempotency / double refund | **Y** | Governance: money and data risk → must fix. Add an idempotency key (needs backend), an in-flight guard, and refresh the ticket before submit | — | *[Sprint]* |
-| I-3 Gift card tickets in Orders Hub | **Y** | Required. Either the backend returns them in the orders feed (preferred) or a new gift card orders API; add card-number search | — | *[Sprint]* |
-| I-4 Per-card refund flow | **Y** | New, small flow for gift cards: select card or reload line → reason → confirm. Do not extend the amount-component flow | — | *[Sprint]* |
-| I-5 Mandatory reason | **Y** | Gift card flow: no default selection; a gift-card-appropriate reason list | — | *[Sprint]* |
-| I-6 Audit fields | **Y** | Show reason and refunding staff on ticket detail; populate `approvedBy` for gift card refunds | *[Ref]* (general refund flow) | *[Sprint]* |
-| I-7 Cash drawer on non-cash refund | **Y (gift card path only)** | Do not open the drawer or log cash for gift card refunds. General refund fix goes to backlog | *[Ref]* | *[Sprint]* |
-| I-8 Sensitive logging | **Y** | Remove card number, PIN and manager PIN from logs. Quick, high value | — | *[Sprint]* |
-| I-9 Tender reuse | **Y** | Auto-select the original tender and disallow change. Confirm the server rule | — | *[Sprint]* |
-| I-10 Permission | **Y** | New `AuthEnum` entry; backend sends it in `userFeatureDtos` | *[Ref]* | *[Sprint]* |
-| I-11 Lost `RefundSuccess` | **Y** | Use replay-safe state for the gift card flow | — | *[Sprint]* |
-| I-12 Buttons / badge | **Y** | Explicit gift card branch in `getStatusTypes`; "Partially Refunded" badge | — | *[Sprint]* |
-| I-13 Receipt / MQTT fields | **Y (receipt only)** | Prefill purchaser email; use the gift card receipt endpoint. MQTT field fix to backlog | *[Ref]* | *[Sprint]* |
-| I-14 Duplicates / stale doc | **N** | Out of scope. Mark the stale doc as outdated | *[Ref]* | *[Sprint]* |
-| I-15 Search debounce | **Y** | Same code we touch; small change | — | *[Sprint]* |
-| I-16 Tests | **Y (scoped)** | Unit tests for eligibility rules (unused / same-day / legacy / already refunded) and ticket-state calculation (partially refunded vs refunded) | *[Ref]* | *[Sprint]* |
+| I-1 Backend contract | **Y (first)** | Everything depends on it. One contract review for all four CRs | *[Ref]* | *[Sprint]* |
+| I-2 Sensitive logging | **Y (first)** | Governance: security risk → must fix before new PII flows. Remove PIN, card number, email, phone and name from logs; mask card numbers | — | *[Sprint]* |
+| I-3 `INVENTORY` hard-wiring | **Y** | Required by Reload and Merge. Introduce one rule per card source (what a source may do: reload, transfer, merge) and use it everywhere | — | *[Sprint]* |
+| I-4 Paid but not loaded | **Y** | Show a clear failure state, allow retry of the E-card call without recharging, and log the event. Needs backend retry behavior | *[Ref]* | *[Sprint]* |
+| I-5 Idempotency for merge/migration | **Y** | Idempotency key (backend), in-flight guard, disable buttons while running, refresh card state after timeout | — | *[Sprint]* |
+| I-6 CFD forms | **Y** | Build one reusable CFD gift card form (name, delivery, message) for purchase and migration; add a "no CFD / skip" path to the POS screen | — | *[Sprint]* |
+| I-7 Shared flow | **Y** | Give merge and the new dialogs their own ViewModel/flow; fix the current-ticket race by replaying or reading state on collect | — | *[Sprint]* |
+| I-8 Commission | **Y (needs product + backend)** | Define where the split applies; the POS must pass it in the payment request | *[Ref]* | *[Sprint]* |
+| I-9 DTO fields | **Y** | Extend the ticket request with recipient, delivery and message; keep source and card id in `replaceCard` | — | *[Sprint]* |
+| I-10 Transfer/merge rules | **Y** | Replace the "INVENTORY target only" rule with the new rules once the product answers (see §7) | — | *[Sprint]* |
+| I-11 Design gallery | **Y** | New screen with category filter, Glide cache; reuse nothing | — | *[Sprint]* |
+| I-12 Validation | **Y (scoped)** | One shared email, phone and length validator used by the new forms; do not rewrite existing screens | *[Ref]* | *[Sprint]* |
+| I-13 Settings fetch | **Y** | Fetch settings when the gift card screen opens; block amount entry until loaded; allow decimals if the PRD requires custom amounts with cents | — | *[Sprint]* |
+| I-14 Refactor | **N** | Too large for this iteration. Extract only a shared receipt builder for gift cards (one function instead of four) | *[Ref]* | *[Sprint]* |
+| I-15 Permissions | **Y** | New `AuthEnum` entries for purchase digital, merge, migrate, reload; apply to buttons | *[Ref]* | *[Sprint]* |
+| I-16 Reports | **Y (needs backend)** | Send an explicit gift card type and reload flag for every tender, not only card | *[Ref]* | *[Sprint]* |
+| I-17 Naming / SMS | **Y** | Align labels with design; confirm whether SMS must work on the CFD | — | *[Sprint]* |
+| I-18 Tests | **Y (scoped)** | Unit tests for source rules, amount validation, discount math, merge total, and form validation | *[Ref]* | *[Sprint]* |
 
-**Governance:** Money and sensitive-data issues are fixed in this iteration. Architectural exceptions need explicit approval. Nothing is ignored without a ticket.
+**Governance:** Security and money issues are fixed in this iteration and before the new flows ship. Architectural exceptions need explicit approval. Nothing is ignored without a ticket.
 
 ---
 
 ## 5. Impact Assessment
 
 ### 5.1 UI Impact
-- **Orders Hub:** gift card tickets appear in the list; search by card number; gift card badges (source, type, Refunded / Partially Refunded); refund reason and refunding staff on the detail pane.
-- **Ticket detail:** "Refund Gift Card" action with a visible disabled reason ("card already used", "already refunded"); legacy cards show no action.
-- **New flow:** pick card/reload → reason (mandatory) → confirm → complete (with receipt).
-- **Navigation:** reuse the existing refund child-fragment host; no new graph destination.
+- **Landing screen:** two new buttons (Purchase Digital Card, Merge Cards).
+- **Digital purchase:** 7 POS screens (amount/design, custom amount, recipient ×2, delivery, review) + 3 CFD screens (name/recipient, delivery, message) + payment + confirmation.
+- **Merge:** pop-up with parent radio, remove button, "Total merge balance", Merge CTA, success toast.
+- **Migration:** transfer pop-up gets a Digital/Physical chooser and a name/phone/email form (POS and CFD).
+- **Reload:** reload icon on each non-inventory card row, "Set a reload value" pop-up, editable amount shown on the row, receipt.
+- **Navigation:** new fragments inside the existing gift card nav graph; no change elsewhere.
 
 ### 5.2 API Contract Impact
-- **Yes, large.** Gift card ticket list/detail with card state (original balance, current balance, issue date, legacy, type, deactivated, reloadable, delivery status, order source, order type), a gift card refund endpoint (atomic zero + deactivate + tender reversal, idempotency key, per-card/reload lines), a refund-lock signal, and receipt support. Older POS builds ignore new fields.
+- **Yes, large.** New or extended endpoints for digital purchase (design, recipient, delivery, message), reload (existing card top-up and payment type), merge (parent + children, total), migration to digital (name, phone, email), and E-card load. Responses must return the card number and, for migration, the PIN. Idempotency keys needed. Older POS builds ignore the new buttons.
 
 ### 5.3 Database Impact
-- Depends on option chosen in I-3. If gift card tickets are returned in the orders feed they need new `ticket_request_table` columns (migration). If a separate API is used, **no DB change** (in-memory/API only). Rollback: unused columns can stay.
+- **None expected.** Gift card tickets are not stored in Room today and the new flows should stay API-driven. No migration.
 
 ### 5.4 Performance Impact
-- Low. Add debounce/query for search. Gift card tickets add rows to Orders Hub; keep pagination.
+- Design gallery images (cache and size). Otherwise low. All calls are online and short.
 
 ### 5.5 Backward Compatibility
-- **Feature flag:** recommended. Gate by the new "Refund Gift Card" permission and a backend flag per restaurant.
-- **Mixed fleet:** older POS builds show no gift card tickets and no refund action (current behavior).
-- **Legacy cards:** no action (PRD out of scope); the legacy marker must come from the backend.
+- **Feature flags recommended** per CR (purchase digital, merge, migration, reload) so each can ship or roll back separately; all behind the existing `isGiftCardEnabled`.
+- Legacy and physical flows must keep working; the transfer-to-physical flow is unchanged.
+- Mixed fleet: older builds show none of the new buttons.
 
 ---
 
@@ -185,41 +202,56 @@ Paths under `pos/src/main/java/aio/app/pos/` unless stated.
 
 | Risk | Probability | Impact | Mitigation |
 | --- | --- | --- | --- |
-| Double refund across POS and MOM or by retry | Medium | **High** | Server-side lock + idempotency key; refresh ticket before confirm; in-flight guard |
-| Used card refunded (balance/same-day rule wrong) | Medium | **High** | Server enforces the rule; client only displays and disables; pure-function tests |
-| Refund to the wrong tender | Low | High | Auto-select original tender; no override |
-| Backend contract not ready | High | **High** | Agree contract first (I-1); POS starts after |
-| Refund succeeded but POS shows failure (timeout/background) | Medium | High | Refresh by ticket id after a timeout; replay-safe success state |
-| Gift-card-tender refund opens drawer / wrong cash log | High | Medium | Gift card path skips cash drawer (I-7) |
-| Sensitive data in logs | High | Medium | Remove now (I-8) |
-| Ticket refunded on MOM not visible on POS until reopened | High | Medium | Fetch ticket state on open and before submit |
-| Scope growth (reload refund, multi-card UX) | Medium | Medium | Confirm in Open Questions |
+| Backend/E-card contract not ready or differs | High | **High** | Agree contract first (I-1); POS starts after |
+| Customer pays but card is not loaded or delivered | Medium | **High** | Retry without recharge; clear failure message; alert on paid-but-unloaded |
+| PIN or PII leaked through logs | High | **High** | Fix before new flows (I-2); review every new log call |
+| Merge or migration applied twice or partially | Medium | High | Idempotency key, in-flight guard, refresh card state after timeout |
+| Wrong cards added through the shared scan flow | Medium | Medium | Dedicated flow for merge (I-7) |
+| CFD form lost or stuck (no collector, no display, dropped action) | Medium | Medium | Replay-safe state; POS fallback and cancel path; timeout decision |
+| Reload missing from receipts or reports | High | Medium | Remove `INVENTORY`-only receipt filter (I-3); send explicit type to Reports (I-16) |
+| Commission split applied wrong | Medium | High | Define the rule, pass it explicitly, test it |
+| Scope growth (4 CRs, 3 CFD flows, gallery) | High | Medium | Ship per CR behind flags; recommended order below |
+
+**Suggested order:** (0) security + shared building blocks (log cleanup, source rules, CFD form, validators), then (1) **Reload** (smallest, existing DTO fields), (2) **Migration to Digital**, (3) **Merge**, (4) **Digital Purchase** (largest, needs gallery + E-card).
 
 **Rollback strategy**
-- Disable the feature flag / "Refund Gift Card" permission to hide the action with no app release.
-- If the POS change has a defect, halt rollout or revert the PR. Gift card state changes made by the backend cannot be undone by a client rollback.
+- Turn the CR's feature flag off to hide its buttons without an app release.
+- If the POS change has a defect, halt rollout or revert that CR's PR. Balance moves made by the backend (merge, migration, reload) cannot be undone by a client rollback.
 
 **Monitoring plan**
-- New Relic events: gift card ticket opened, refund started / success / failed (with ticket id and card id, never card number or PIN), refund blocked (reason), duplicate suppressed.
-- Alert on a refund request without a matching completion, and on any `refund-initiated` ticket older than the timeout.
+- New Relic events per flow: started, payment done, E-card/merge/migration API success or failure, delivery failure, duplicate suppressed (**no card number, PIN or contact details in any event**).
+- Alert on paid gift card tickets without a loaded card, and on merge/migration requests without a completion.
 
 ---
 
 ## 7. Open Questions (blocking)
 
-1. **Backend:** Which endpoint returns gift card purchase tickets for Orders Hub and MOM? Is the ticket the same object as a normal ticket? Which fields are provided (original balance, issue date, legacy, type, delivery status, order source/type)?
-2. **Eligibility rules conflict in the PRD.** Story 1 says the action is enabled when balance < original ("user will select the card to refund") and also when the refund is the same day; Story 2 (MOM) says it is hidden with "card already used" after the purchase date. **What is the final rule?** Where is it enforced (server preferred)?
-3. **"Same calendar day":** In which time zone, and from which timestamp?
-4. **Reload refunds:** The PRD says only the reloaded amount is refunded. How is a reload represented as a separate refundable line? The POS has no reload-sale flow today.
-5. **Partial refund and partial usage:** Can a card be refunded for the remaining balance only? Today one refund per payment is allowed.
-6. **Original tender = gift card:** To which card is value returned (the same card)? Which endpoint? Is the refund of a gift-card-tender purchase also a "refund of a gift card purchase"?
-7. **Cash refunds on POS:** Does the cash drawer open for the cash-purchase refund? How is it logged?
-8. **Physical reload after refund:** Is a "reloadable" flag displayed on the POS, or is it backend-only? Does the existing reload flow need to accept refunded cards?
-9. **Digital card + recipient email:** Where is recipient email captured on POS today? (No digital sale or email capture was found in the POS code.)
-10. **Lock:** How does POS learn that MOM refunded? Is there an MQTT event, or only a fetch on open?
-11. **Permission:** Name and default roles for "Refund Gift Card"; does the manager approval PIN apply?
-12. **Receipts:** Printed refund receipt content for a gift card; email goes to the purchaser's address from the original payment?
-13. **"Order Type = Digital Gift Card" and "Order Source = POS/Online"** values: confirm the exact backend strings.
+**Shared**
+1. **Backend/E-card:** which endpoints and payloads for digital purchase, reload, merge and migration? Is delivery (email/SMS, message) done by the backend after payment? What if the E-card call fails after payment?
+2. **Permissions:** which roles may purchase digital, merge, migrate, reload? Is manager approval needed for merge and migration?
+3. **CFD:** is the CFD required or optional for the digital flows? What happens on a single-screen device or when the customer does not respond (timeout, cancel)? The PRD says "Switch to CFD"; existing UI says "Switch to guest".
+4. **Offline:** all gift card operations are online-only today. Confirm that stays true.
+
+**Digital purchase**
+5. Where do designs and categories come from (API, count, images)? What are the custom amount min and max and decimal rules? What is the personal message limit?
+6. Is text (SMS) delivery supported by the backend? The CFD SMS button is currently commented out.
+7. Is a gift card allowed as the tender for a digital purchase? (Allowed today for physical.)
+8. Can a digital purchase be added to an open ticket ("the selected amount is reflected in the ticket total")? Gift card tickets are separate from normal tickets today.
+
+**Reload**
+9. The card must be **active**? Which card sources can be reloaded (physical, digital, migrated)? Digital cards are entered manually only: confirm.
+10. Commission split: where is it configured, and does it apply to every card payment or only to reload?
+11. Does the gift card purchase discount apply to reload amounts (PRD says yes)? Is approval needed for the discount?
+12. Receipt: one receipt for the whole bill, with reload lines marked "Reload"?
+
+**Migration**
+13. Is the new digital card created from inventory, or generated by E-card? Is the old card deactivated? Is the PIN shown on the POS or only emailed?
+14. Phone is optional or required? Is the transferred amount always the full balance?
+
+**Merge**
+15. Which sources can merge into which? Can a digital card be a child? What happens to the child cards (zeroed, deactivated)? Is there a max card count?
+16. What does "the merge event is consumed by the marketing module" mean for the POS: does the backend emit it, or must the POS send an event?
+17. The PRD uses both "Merge" and "Transfer" for the CTA ("Transfer button is enabled"): confirm the label.
 
 ---
 
